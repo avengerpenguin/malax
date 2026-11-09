@@ -10,6 +10,7 @@ import uuid
 from collections.abc import AsyncIterator, Callable
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import asynccontextmanager
+from dataclasses import dataclass
 from typing import Any
 
 import mlx.core as mx
@@ -186,6 +187,8 @@ class ResponsesRequest(BaseModel):
     input: str | list[InputMessage]
     instructions: str | None = None
     max_output_tokens: int = 512
+    temperature: float | None = None
+    top_p: float | None = None
     stream: bool = False
 
 
@@ -353,38 +356,62 @@ def to_chat_messages(request: ResponsesRequest) -> tuple[list[dict[str, str]], l
     return messages, images
 
 
+@dataclass
+class GenerationStats:
+    tokens: int = 0
+
+
 async def stream_mlx_generate(
     *,
-    model_name: str,
+    request: ResponsesRequest,
     messages: list[dict[str, str]],
     images: list[Image.Image],
-    max_tokens: int,
+    stats: GenerationStats,
 ) -> AsyncIterator[str]:
     async with active_model.session():
         model, processor, config = await active_model.load(
-            model_name, lambda: (*load(model_name), load_config(model_name))
+            request.model, lambda: (*load(request.model), load_config(request.model))
         )
         prompt = apply_chat_template(processor, config, messages, num_images=len(images))
 
         chunks = stream_generate(
-            model, processor, prompt, images or None, max_tokens=max_tokens
+            model,
+            processor,
+            prompt,
+            images or None,
+            max_tokens=request.max_output_tokens,
+            temperature=request.temperature,
+            top_p=request.top_p,
         )
         # Each step runs on the single MLX thread; the lock is held until the stream ends.
         while (chunk := await run_on_mlx_thread(next, chunks, None)) is not None:
+            stats.tokens += 1
             if chunk.text:
                 yield chunk.text
 
 
 def response_object(
-    *, response_id: str, message_id: str, model: str, text: str | None
+    *,
+    request: ResponsesRequest,
+    response_id: str,
+    message_id: str,
+    text: str | None,
+    truncated: bool = False,
 ) -> dict[str, Any]:
+    if text is None:
+        status = "in_progress"
+    elif truncated:
+        status = "incomplete"
+    else:
+        status = "completed"
+
     output = []
     if text is not None:
         output.append(
             {
                 "type": "message",
                 "id": message_id,
-                "status": "completed",
+                "status": status,
                 "role": "assistant",
                 "content": [{"type": "output_text", "text": text, "annotations": []}],
             }
@@ -394,14 +421,23 @@ def response_object(
         "id": response_id,
         "object": "response",
         "created_at": now_unix(),
-        "status": "completed" if text is not None else "in_progress",
-        "model": model,
+        "status": status,
+        "incomplete_details": {"reason": "max_output_tokens"} if truncated else None,
+        "model": request.model,
         "output": output,
+        "max_output_tokens": request.max_output_tokens,
+        "temperature": request.temperature,
+        "top_p": request.top_p,
     }
 
 
 async def stream_response_events(
-    *, chunks: AsyncIterator[str], response_id: str, message_id: str, model: str
+    *,
+    chunks: AsyncIterator[str],
+    stats: GenerationStats,
+    request: ResponsesRequest,
+    response_id: str,
+    message_id: str,
 ) -> AsyncIterator[str]:
     sequence = itertools.count()
 
@@ -409,7 +445,7 @@ async def stream_response_events(
         payload = {"type": type_, "sequence_number": next(sequence), **fields}
         return f"event: {type_}\ndata: {json.dumps(payload)}\n\n"
 
-    ids = {"response_id": response_id, "message_id": message_id, "model": model}
+    ids = {"request": request, "response_id": response_id, "message_id": message_id}
 
     yield event("response.created", response=response_object(**ids, text=None))
 
@@ -425,7 +461,11 @@ async def stream_response_events(
             logprobs=[],
         )
 
-    yield event("response.completed", response=response_object(**ids, text=text))
+    truncated = stats.tokens >= request.max_output_tokens
+    yield event(
+        "response.incomplete" if truncated else "response.completed",
+        response=response_object(**ids, text=text, truncated=truncated),
+    )
 
 
 @app.get("/health")
@@ -452,26 +492,25 @@ async def responses(request: ResponsesRequest):
         *(asyncio.to_thread(fetch_image, url) for url in image_urls)
     )
 
+    stats = GenerationStats()
     chunks = stream_mlx_generate(
-        model_name=request.model,
-        messages=messages,
-        images=images,
-        max_tokens=request.max_output_tokens,
+        request=request, messages=messages, images=images, stats=stats
     )
     ids = {
+        "request": request,
         "response_id": f"resp_{uuid.uuid4().hex}",
         "message_id": f"msg_{uuid.uuid4().hex}",
-        "model": request.model,
     }
 
     if request.stream:
         return StreamingResponse(
-            stream_response_events(chunks=chunks, **ids),
+            stream_response_events(chunks=chunks, stats=stats, **ids),
             media_type="text/event-stream",
         )
 
     text = "".join([chunk async for chunk in chunks])
-    return response_object(**ids, text=text)
+    truncated = stats.tokens >= request.max_output_tokens
+    return response_object(**ids, text=text, truncated=truncated)
 
 
 @app.post("/image/generate", response_class=StreamingResponse)

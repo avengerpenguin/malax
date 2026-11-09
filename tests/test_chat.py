@@ -72,3 +72,42 @@ def test_stream(client):
             full_output += event.delta
 
     assert full_output == '\n'.join(['double bubble bath']*10)
+
+
+def test_max_output_tokens(client):
+    response = client.responses.create(
+        model="mlx-community/Qwen3.5-4B-MLX-4bit",
+        input="Write a long essay about the history of the Python language.",
+        max_output_tokens=16,
+    )
+    assert response.status == "incomplete"
+    assert response.incomplete_details.reason == "max_output_tokens"
+
+
+def test_temperature_zero_is_deterministic(client):
+    def ask():
+        return client.responses.create(
+            model="mlx-community/Qwen3.5-4B-MLX-4bit",
+            input="Invent a name for a pet goldfish.",
+            temperature=0,
+            max_output_tokens=32,
+        )
+
+    first, second = ask(), ask()
+    assert first.temperature == 0
+    assert first.output_text == second.output_text
+
+
+def test_high_temperature_varies(client):
+    def ask():
+        return client.responses.create(
+            model="mlx-community/Qwen3.5-4B-MLX-4bit",
+            input="Invent a name for a pet goldfish.",
+            temperature=1.5,
+            top_p=0.95,
+            max_output_tokens=32,
+        )
+
+    first, second = ask(), ask()
+    assert (first.temperature, first.top_p) == (1.5, 0.95)
+    assert first.output_text != second.output_text
