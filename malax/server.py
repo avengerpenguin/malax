@@ -7,17 +7,17 @@ import itertools
 import json
 import os
 import random
-import re
 import tempfile
 import time
 import traceback
 import uuid
+import weakref
 from collections.abc import AsyncIterator, Callable
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 import mlx.core as mx
 import requests
@@ -28,14 +28,13 @@ from mlx_vlm import load, stream_generate
 from mlx_vlm.prompt_utils import apply_chat_template
 from mlx_vlm.utils import load_config
 from PIL import Image
-from pydantic import BaseModel, Field, ValidationError
+from pydantic import BaseModel, Field, ValidationError, model_validator
 from starlette.datastructures import UploadFile
 
 
 USER_AGENT = os.getenv("HTTP_USER_AGENT", "malax/0.1 (local ML gateway)")
-
-EXAMPLE_IMAGE_MODEL = "flux2.variants.Flux2Klein/flux2_klein_base_4b"
-
+# MLX keeps freed buffers for reuse; uncapped, that cache can be as big as the model itself.
+MLX_CACHE_LIMIT_GB = float(os.getenv("MLX_CACHE_LIMIT_GB", "2"))
 mlx_executor: ThreadPoolExecutor | None = None
 
 
@@ -46,14 +45,25 @@ async def run_on_mlx_thread(func, *args, **kwargs):
 
 def clear_mlx_cache_sync():
     gc.collect()
+    mx.clear_cache()
+    mx.reset_peak_memory()
 
-    try:
-        mx.clear_cache()
-    except AttributeError:
-        try:
-            mx.metal.clear_cache()
-        except AttributeError:
-            pass
+
+def load_sync(loader: Callable[[], Any]) -> Any:
+    model = loader()
+    # Free intermediates from loading (e.g. LoRA baking) before generation needs the memory.
+    gc.collect()
+    mx.clear_cache()
+    return model
+
+
+def memory_stats() -> str:
+    gb = 1024**3
+    return (
+        f"active={mx.get_active_memory() / gb:.1f}GB "
+        f"cache={mx.get_cache_memory() / gb:.1f}GB "
+        f"peak={mx.get_peak_memory() / gb:.1f}GB"
+    )
 
 
 class ActiveModel:
@@ -63,7 +73,6 @@ class ActiveModel:
         self.name: str | None = None
         self.model: Any | None = None
         self.lock = asyncio.Lock()
-        self.active_request_id: str | None = None
         self.waiting_requests: int = 0
 
     @asynccontextmanager
@@ -74,23 +83,21 @@ class ActiveModel:
         finally:
             self.waiting_requests -= 1
 
-        self.active_request_id = uuid.uuid4().hex
         try:
             yield
         finally:
-            self.active_request_id = None
             self.lock.release()
 
     async def load(self, name: str, loader: Callable[[], Any]) -> Any:
-        if self.name == name and self.model is not None:
+        if self.name == name:
             return self.model
 
         await self.unload()
 
         print(f"Loading model: {name}")
-        self.model = await run_on_mlx_thread(loader)
+        self.model = await run_on_mlx_thread(load_sync, loader)
         self.name = name
-        print(f"Loaded model: {name}")
+        print(f"Loaded model: {name} ({memory_stats()})")
 
         return self.model
 
@@ -98,12 +105,26 @@ class ActiveModel:
         if self.model is None:
             return
 
-        print(f"Unloading model: {self.name}")
+        print(f"Unloading model: {self.name} ({memory_stats()})")
+
+        # Chat models are a (model, processor, config) tuple; track the model itself.
+        target = self.model[0] if isinstance(self.model, tuple) else self.model
+        try:
+            ref = weakref.ref(target)
+        except TypeError:
+            ref = None
+        del target
 
         self.model = None
         self.name = None
 
         await run_on_mlx_thread(clear_mlx_cache_sync)
+
+        if ref is not None and (leaked := ref()) is not None:
+            holders = [type(r).__name__ for r in gc.get_referrers(leaked)]
+            print(f"WARNING: model still alive after unload, referenced by: {holders}")
+            del leaked
+        print(f"Unloaded ({memory_stats()})")
 
 
 active_model = ActiveModel()
@@ -130,12 +151,18 @@ class ResponsesRequest(BaseModel):
     stream: bool = False
 
 
+SIZE_PATTERN = r"^(auto|\d+x\d+)$"
+
+# Request fields baked in when the model is constructed; changing any of them means a reload.
+LOAD_TIME_FIELDS = {"model", "quantize", "base_model", "lora_paths", "lora_scales"}
+
+
 class ImageGenerationRequest(BaseModel):
     model: str
     prompt: str
     n: int = Field(1, ge=1, le=10)
-    size: str = "1024x1024"
-    response_format: str = "b64_json"
+    size: str = Field("1024x1024", pattern=SIZE_PATTERN)
+    response_format: Literal["b64_json"] = "b64_json"
 
     # mflux extensions; send these via `extra_body` from the OpenAI SDK.
     seed: int | None = None
@@ -143,11 +170,29 @@ class ImageGenerationRequest(BaseModel):
     guidance: float | None = None
     negative_prompt: str | None = None
     quantize: int | None = None
+    base_model: str | None = None
+    lora_paths: list[str] = []
+    lora_scales: list[float] = []
+
+    @model_validator(mode="after")
+    def check_lora_scales(self):
+        if self.lora_scales and len(self.lora_scales) != len(self.lora_paths):
+            raise ValueError("lora_scales must have one entry per lora_paths entry")
+        return self
+
+    def model_key(self) -> str:
+        return json.dumps(self.model_dump(include=LOAD_TIME_FIELDS))
+
+    def size_kwargs(self) -> dict[str, int]:
+        """No width/height for "auto", so mflux picks (from the input images, for edits)."""
+        if self.size == "auto":
+            return {}
+        width, height = map(int, self.size.split("x"))
+        return {"width": width, "height": height}
 
 
 class ImageEditRequest(ImageGenerationRequest):
-    # "auto" lets mflux size the output from the input images.
-    size: str = "auto"
+    size: str = Field("auto", pattern=SIZE_PATTERN)
 
 
 @asynccontextmanager
@@ -155,6 +200,7 @@ async def lifespan(app: FastAPI):
     global mlx_executor
 
     mlx_executor = ThreadPoolExecutor(max_workers=1)
+    mx.set_cache_limit(int(MLX_CACHE_LIMIT_GB * 1024**3))
     print("Local ML gateway starting")
 
     yield
@@ -177,50 +223,53 @@ def model_config_names() -> list[str]:
     )
 
 
-def resolve_mflux_model(spec: str) -> tuple[type, Callable[[], ModelConfig]]:
-    """Resolve '<module>.<Class>/<config>' to an mflux model class and ModelConfig factory."""
-    class_path, slash, config_name = spec.partition("/")
+def mflux_loader(request: ImageGenerationRequest) -> Callable[[], Any]:
+    """Resolve '<module>.<Class>/<config or repo>' into a function that builds the model."""
+    class_path, _, config_name = request.model.partition("/")
     module_path, _, class_name = class_path.rpartition(".")
 
-    if not slash or not module_path or not config_name:
+    if not module_path or not config_name:
         raise HTTPException(
             status_code=400,
-            detail=f"Image model must look like '<module>.<Class>/<config>', "
-            f"e.g. '{EXAMPLE_IMAGE_MODEL}'",
+            detail="Image model must look like '<module>.<Class>/<config or repo>', "
+            "e.g. 'flux2.variants.Flux2Klein/flux2_klein_4b'",
         )
 
     try:
-        module = importlib.import_module(f"mflux.models.{module_path}")
-        model_class = getattr(module, class_name)
+        model_class = getattr(importlib.import_module(f"mflux.models.{module_path}"), class_name)
     except (ImportError, AttributeError) as e:
-        raise HTTPException(
-            status_code=400, detail=f"Unknown mflux model class '{class_path}': {e}"
-        )
+        raise HTTPException(status_code=400, detail=f"Unknown mflux model class '{class_path}': {e}")
+
+    # Only pass what the client set, so mflux applies its own defaults.
+    kwargs: dict[str, Any] = {
+        name: value
+        for name, value in {
+            "quantize": request.quantize,
+            "lora_paths": request.lora_paths,
+            "lora_scales": request.lora_scales,
+        }.items()
+        if value
+    }
 
     factory = getattr(ModelConfig, config_name.replace("-", "_"), None)
-    if not callable(factory):
-        raise HTTPException(
-            status_code=400,
-            detail={
-                "message": f"Unknown ModelConfig '{config_name}'",
-                "available": model_config_names(),
-            },
-        )
+    if callable(factory):
+        kwargs["model_config"] = factory()
+    else:
+        # A HF repo id or local path: infer the architecture, take the weights from the repo.
+        try:
+            kwargs["model_config"] = ModelConfig.from_name(config_name, base_model=request.base_model)
+        except Exception as e:
+            raise HTTPException(
+                status_code=400,
+                detail={
+                    "message": f"Unknown ModelConfig, repo or path '{config_name}': {e}",
+                    "hint": "For third-party repos, set base_model in extra_body, e.g. 'flux2-klein-4b'",
+                    "available": model_config_names(),
+                },
+            )
+        kwargs["model_path"] = config_name
 
-    return model_class, factory
-
-
-def parse_size(size: str) -> tuple[int, int]:
-    if size == "auto":
-        return 1024, 1024
-
-    match = re.fullmatch(r"(\d+)x(\d+)", size)
-    if not match:
-        raise HTTPException(
-            status_code=400, detail=f"Invalid size '{size}', expected WIDTHxHEIGHT"
-        )
-
-    return int(match[1]), int(match[2])
+    return lambda: model_class(**kwargs)
 
 
 def png_base64(image: Image.Image) -> str:
@@ -229,9 +278,7 @@ def png_base64(image: Image.Image) -> str:
     return base64.b64encode(buffer.getvalue()).decode()
 
 
-def generate_images_sync(
-    model: Any, request: ImageGenerationRequest, **inputs: Any
-) -> list[str]:
+def generate_images_sync(model: Any, request: ImageGenerationRequest, **inputs: Any) -> list[str]:
     seed = request.seed if request.seed is not None else random.randrange(2**32)
 
     # Only pass what the client set, so mflux applies its own per-model defaults.
@@ -250,6 +297,7 @@ def generate_images_sync(
             model.generate_image(
                 seed=seed + i,
                 prompt=request.prompt,
+                **request.size_kwargs(),
                 **inputs,
                 **options,
             ).image
@@ -260,20 +308,11 @@ def generate_images_sync(
 
 async def run_mflux(request: ImageGenerationRequest, **inputs: Any) -> dict[str, Any]:
     """Load the requested mflux model and generate images; shared by generations and edits."""
-    if request.response_format != "b64_json":
-        raise HTTPException(status_code=400, detail="Only response_format=b64_json is supported")
-
-    model_class, config_factory = resolve_mflux_model(request.model)
-
-    # Quantization changes the loaded weights, so it is part of the model identity.
-    model_key = f"{request.model}?quantize={request.quantize}"
+    loader = mflux_loader(request)
 
     try:
         async with active_model.session():
-            model = await active_model.load(
-                model_key,
-                lambda: model_class(quantize=request.quantize, model_config=config_factory()),
-            )
+            model = await active_model.load(request.model_key(), loader)
             images = await run_on_mlx_thread(generate_images_sync, model, request, **inputs)
     except Exception as e:
         traceback.print_exc()
@@ -444,7 +483,6 @@ async def health():
         "model": {
             "active": active_model.name,
             "busy": active_model.lock.locked(),
-            "active_request_id": active_model.active_request_id,
             "waiting_requests": active_model.waiting_requests,
         },
     }
@@ -480,8 +518,7 @@ async def responses(request: ResponsesRequest):
 
 @app.post("/v1/images/generations")
 async def images_generations(request: ImageGenerationRequest):
-    width, height = parse_size(request.size)
-    return await run_mflux(request, width=width, height=height)
+    return await run_mflux(request)
 
 
 @app.post("/v1/images/edits")
@@ -495,15 +532,20 @@ async def images_edits(http_request: Request):
     if "mask" in form:
         raise HTTPException(status_code=400, detail="mask is not supported")
 
-    fields = {k: v for k, v in form.items() if not isinstance(v, UploadFile)}
+    # Multipart has no arrays; the SDK sends lists as repeated `key[]` fields.
+    fields: dict[str, Any] = {}
+    for key in form.keys():
+        if key in ("image", "image[]"):
+            continue
+        if key.endswith("[]"):
+            fields[key[:-2]] = form.getlist(key)
+        else:
+            fields[key] = form[key]
+
     try:
         request = ImageEditRequest(**fields)
     except ValidationError as e:
         raise HTTPException(status_code=422, detail=e.errors())
-
-    inputs = {}
-    if request.size != "auto":
-        inputs["width"], inputs["height"] = parse_size(request.size)
 
     # mflux edit models take file paths, so stage the uploads on disk for the request.
     with tempfile.TemporaryDirectory() as tmp:
@@ -513,7 +555,7 @@ async def images_edits(http_request: Request):
             path.write_bytes(await upload.read())
             paths.append(str(path))
 
-        return await run_mflux(request, image_paths=paths, **inputs)
+        return await run_mflux(request, image_paths=paths)
 
 
 if __name__ == "__main__":

@@ -16,6 +16,7 @@ dependencies = [
     "python-multipart",
     "uvicorn",
     "pillow",
+    "pydantic",
 ]
 
 [project.optional-dependencies]
@@ -24,9 +25,8 @@ test = [
     "pytest",
     "pytest-asyncio",
     "pytest-pikachu",
-    "pytest-xdist",
 ]
 
 [tool.pytest]
-addopts = ["--pikachu", "-n", "auto"]
+addopts = ["--pikachu"]
 testpaths = ["tests"]
