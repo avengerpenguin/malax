@@ -1,0 +1,29 @@
+[build-system]
+requires = ["setuptools", "setuptools-scm"]
+build-backend = "setuptools.build_meta"
+
+[project]
+requires-python = ">= 3.11"
+dynamic = ["version"]
+name = "malax"
+dependencies = [
+    "langchain >= 1.4.0",
+    "mlx-lm",
+    "mlx",
+    "mflux",
+    "fastapi",
+    "uvicorn",
+    "pillow",
+]
+
+[project.optional-dependencies]
+test = [
+    "openai",
+    "pytest",
+    "pytest-asyncio",
+    "pytest-pikachu",
+]
+
+[tool.pytest]
+addopts = ["--pikachu"]
+testpaths = ["tests"]
