@@ -1,22 +1,26 @@
 import asyncio
 import gc
 import io
+import itertools
 import json
 import os
 import time
 import traceback
 import uuid
+from collections.abc import AsyncIterator, Callable
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import asynccontextmanager
-from typing import Any, Literal
+from typing import Any
 
 import mlx.core as mx
-import torch
+import requests
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import StreamingResponse
-from mlx_lm import generate, load
+from mlx_vlm import load, stream_generate
+from mlx_vlm.prompt_utils import apply_chat_template
+from mlx_vlm.utils import load_config
 from PIL import Image
-from pydantic import BaseModel, ConfigDict
+from pydantic import BaseModel
 from mflux.models.common.config import ModelConfig
 from mflux.models.krea2 import Krea2
 from mflux.models.qwen.variants.txt2img.qwen_image import QwenImage
@@ -91,24 +95,14 @@ DEFAULT_NEGATIVE_PROMPT = (
     "airbrushed, drawing, watermark, text"
 )
 
-text_mlx_executor = ThreadPoolExecutor(max_workers=1)
-image_mlx_executor = ThreadPoolExecutor(max_workers=1)
+USER_AGENT = os.getenv("HTTP_USER_AGENT", "malax/0.1 (local ML gateway)")
+
+mlx_executor: ThreadPoolExecutor | None = None
 
 
-async def run_on_executor(executor: ThreadPoolExecutor, func, *args, **kwargs):
+async def run_on_mlx_thread(func, *args, **kwargs):
     loop = asyncio.get_running_loop()
-    return await loop.run_in_executor(
-        executor,
-        lambda: func(*args, **kwargs),
-    )
-
-
-async def run_on_text_mlx_thread(func, *args, **kwargs):
-    return await run_on_executor(text_mlx_executor, func, *args, **kwargs)
-
-
-async def run_on_image_mlx_thread(func, *args, **kwargs):
-    return await run_on_executor(image_mlx_executor, func, *args, **kwargs)
+    return await loop.run_in_executor(mlx_executor, lambda: func(*args, **kwargs))
 
 
 def clear_mlx_cache_sync():
@@ -123,185 +117,41 @@ def clear_mlx_cache_sync():
             pass
 
 
-def clear_torch_cache_sync():
-    gc.collect()
+class ActiveModel:
+    """Holds at most one model (chat or image) in memory at a time."""
 
-    if torch.backends.mps.is_available():
-        torch.mps.empty_cache()
-        torch.mps.synchronize()
-
-
-class ActiveMlxModel:
     def __init__(self):
-        self.model_name: str | None = None
+        self.name: str | None = None
         self.model: Any | None = None
-        self.tokenizer: Any | None = None
         self.lock = asyncio.Lock()
         self.active_request_id: str | None = None
         self.waiting_requests: int = 0
 
-    def is_loaded(self, model_name: str) -> bool:
-        return (
-            self.model_name == model_name
-            and self.model is not None
-            and self.tokenizer is not None
-        )
-
-    async def acquire_for_request(self, request_id: str):
+    @asynccontextmanager
+    async def session(self):
         self.waiting_requests += 1
         try:
             await self.lock.acquire()
         finally:
             self.waiting_requests -= 1
 
-        self.active_request_id = request_id
-
-    def release_request(self):
-        self.active_request_id = None
-        self.lock.release()
-
-    async def load_for_request(self, model_name: str):
-        if self.is_loaded(model_name):
-            return self.model, self.tokenizer
-
-        await self.unload()
-
-        print(f"Loading MLX model: {model_name}")
-        self.model, self.tokenizer = await run_on_text_mlx_thread(load, model_name)
-        self.model_name = model_name
-        print(f"Loaded MLX model: {model_name}")
-
-        return self.model, self.tokenizer
-
-    async def unload(self):
-        if self.model is None and self.tokenizer is None:
-            return
-
-        print(f"Unloading MLX model: {self.model_name}")
-
-        self.model = None
-        self.tokenizer = None
-        self.model_name = None
-
-        await run_on_text_mlx_thread(clear_mlx_cache_sync)
-
-
-active_mlx_model = ActiveMlxModel()
-
-
-class ActiveImagePipeline:
-    def __init__(self):
-        self.model_name: str | None = None
-        self.pipeline: Any | None = None
-        self.lock = asyncio.Lock()
-        self.active_request_id: str | None = None
-        self.waiting_requests: int = 0
-
-    def is_loaded(self, model_name: str) -> bool:
-        return self.model_name == model_name and self.pipeline is not None
-
-    async def acquire_for_request(self, request_id: str):
-        self.waiting_requests += 1
+        self.active_request_id = uuid.uuid4().hex
         try:
-            await self.lock.acquire()
+            yield
         finally:
-            self.waiting_requests -= 1
+            self.active_request_id = None
+            self.lock.release()
 
-        self.active_request_id = request_id
-
-    def release_request(self):
-        self.active_request_id = None
-        self.lock.release()
-
-    async def load_for_request(self, model_name: str):
-        if self.is_loaded(model_name):
-            return self.pipeline
-
-        await self.unload()
-
-        config = SUPPORTED_IMAGE_MODELS[model_name]
-
-        if config.get("backend") != "diffusers":
-            raise RuntimeError(f"Image model {model_name} is not a Diffusers model")
-
-        print(f"Loading image model: {model_name} ({config['model_id']})")
-
-        load_kwargs = {
-            "torch_dtype": config["torch_dtype"],
-        }
-
-        if config["variant"] is not None:
-            load_kwargs["variant"] = config["variant"]
-
-        pipe = await asyncio.to_thread(
-            config["pipeline"].from_pretrained,
-            config["model_id"],
-            **load_kwargs,
-        )
-
-        if torch.backends.mps.is_available():
-            pipe = pipe.to("mps")
-
-        self.pipeline = pipe
-        self.model_name = model_name
-
-        print(f"Loaded image model: {model_name}")
-
-        return self.pipeline
-
-    async def unload(self):
-        if self.pipeline is None:
-            return
-
-        print(f"Unloading image model: {self.model_name}")
-
-        self.pipeline = None
-        self.model_name = None
-
-        await asyncio.to_thread(clear_torch_cache_sync)
-
-
-active_image_pipeline = ActiveImagePipeline()
-
-
-class ActiveMfluxImageModel:
-    def __init__(self):
-        self.model_name: str | None = None
-        self.model: Any | None = None
-
-    def is_loaded(self, model_name: str) -> bool:
-        return self.model_name == model_name and self.model is not None
-
-    async def load_for_request(self, model_name: str):
-        if self.is_loaded(model_name):
+    async def load(self, name: str, loader: Callable[[], Any]) -> Any:
+        if self.name == name and self.model is not None:
             return self.model
 
         await self.unload()
 
-        config = SUPPORTED_IMAGE_MODELS[model_name]
-        model_class = config["model_class"]
-
-        if model_class is None or ModelConfig is None:
-            raise RuntimeError(
-                f"mflux model class for {model_name} is unavailable. Is mflux installed?"
-            )
-
-        print(
-            f"Loading mflux image model: {model_name} quantize={config.get('quantize')}"
-        )
-
-        constructor_kwargs = {
-            "quantize": config.get("quantize"),
-        }
-
-        model_config_factory = config.get("model_config_factory")
-        if model_config_factory is not None:
-            constructor_kwargs["model_config"] = model_config_factory()
-
-        self.model = await run_on_image_mlx_thread(model_class, **constructor_kwargs)
-        self.model_name = model_name
-
-        print(f"Loaded mflux image model: {model_name}")
+        print(f"Loading model: {name}")
+        self.model = await run_on_mlx_thread(loader)
+        self.name = name
+        print(f"Loaded model: {name}")
 
         return self.model
 
@@ -309,37 +159,33 @@ class ActiveMfluxImageModel:
         if self.model is None:
             return
 
-        print(f"Unloading mflux image model: {self.model_name}")
+        print(f"Unloading model: {self.name}")
 
         self.model = None
-        self.model_name = None
+        self.name = None
 
-        await run_on_image_mlx_thread(clear_mlx_cache_sync)
-
-
-active_mflux_image_model = ActiveMfluxImageModel()
+        await run_on_mlx_thread(clear_mlx_cache_sync)
 
 
-class ChatMessage(BaseModel):
-    model_config = ConfigDict(extra="allow")
-
-    role: Literal["system", "user", "assistant", "tool", "developer"]
-    content: str | list[dict[str, Any]] | None = ""
+active_model = ActiveModel()
 
 
-class ChatCompletionRequest(BaseModel):
-    model: str | None = None
-    messages: list[ChatMessage]
-    temperature: float = 0.7
-    max_tokens: int = 512
-    stream: bool = False
+class InputContent(BaseModel):
+    type: str
+    text: str | None = None
+    image_url: str | None = None
 
 
-class CompletionRequest(BaseModel):
-    model: str | None = None
-    prompt: str
-    temperature: float = 0.7
-    max_tokens: int = 512
+class InputMessage(BaseModel):
+    role: str
+    content: str | list[InputContent]
+
+
+class ResponsesRequest(BaseModel):
+    model: str
+    input: str | list[InputMessage]
+    instructions: str | None = None
+    max_output_tokens: int = 512
     stream: bool = False
 
 
@@ -356,18 +202,18 @@ class ImageGenerationRequest(BaseModel):
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    global mlx_executor
+
+    mlx_executor = ThreadPoolExecutor(max_workers=1)
+
     print("Local ML gateway starting")
     print(f"Supported image models: {list(SUPPORTED_IMAGE_MODELS.keys())}")
     print(f"Default image model: {DEFAULT_IMAGE_MODEL}")
 
     yield
 
-    await active_mlx_model.unload()
-    await active_image_pipeline.unload()
-    await active_mflux_image_model.unload()
-
-    text_mlx_executor.shutdown(wait=True, cancel_futures=False)
-    image_mlx_executor.shutdown(wait=True, cancel_futures=False)
+    await active_model.unload()
+    mlx_executor.shutdown(wait=True, cancel_futures=False)
 
 
 app = FastAPI(
@@ -426,41 +272,12 @@ def image_to_png_stream(image: Any) -> io.BytesIO:
     return img_byte_arr
 
 
-def run_image_generation_sync(
-    pipe: Any, model_name: str, request: ImageGenerationRequest
-):
-    negative_prompt = request.negative_prompt or DEFAULT_NEGATIVE_PROMPT
-
-    if model_name == "qwen":
-        width = request.width if request.width != 1024 else 512
-        height = request.height if request.height != 1024 else 768
-        steps = request.steps if request.steps != 25 else 10
-
-        kwargs = {
-            "prompt": request.prompt,
-            "negative_prompt": negative_prompt,
-            "width": width,
-            "height": height,
-            "num_inference_steps": steps,
-            "true_cfg_scale": 1.2,
-        }
-        if request.seed is not None:
-            kwargs["generator"] = torch.Generator("cpu").manual_seed(request.seed)
-
-        output = pipe(**kwargs)
-        return output.images[0]
-
-    output = pipe(
-        prompt=request.prompt,
-        negative_prompt=negative_prompt,
-        width=request.width,
-        height=request.height,
-        num_inference_steps=request.steps,
-        guidance_scale=request.guidance_scale,
-        true_cfg_scale=1.1,
+def load_mflux_model_sync(model_name: str) -> Any:
+    config = SUPPORTED_IMAGE_MODELS[model_name]
+    return config["model_class"](
+        quantize=config["quantize"],
+        model_config=config["model_config_factory"](),
     )
-
-    return output.images[0]
 
 
 def run_mflux_image_generation_sync(
@@ -500,395 +317,184 @@ def now_unix() -> int:
     return int(time.time())
 
 
-def chat_content_to_text(content: str | list[dict[str, Any]] | None) -> str:
-    if content is None:
-        return ""
-
-    if isinstance(content, str):
-        return content
-
-    text_parts: list[str] = []
-
-    for part in content:
-        if not isinstance(part, dict):
-            continue
-
-        if part.get("type") == "text":
-            text = part.get("text")
-            if isinstance(text, str):
-                text_parts.append(text)
-
-    return "\n".join(text_parts)
+def fetch_image(url: str) -> Image.Image:
+    response = requests.get(url, headers={"User-Agent": USER_AGENT}, timeout=30)
+    response.raise_for_status()
+    return Image.open(io.BytesIO(response.content))
 
 
-def chat_messages_to_prompt(tokenizer: Any, messages: list[ChatMessage]) -> str:
-    raw_messages = [
-        {
-            "role": "system" if message.role == "developer" else message.role,
-            "content": chat_content_to_text(message.content),
-        }
-        for message in messages
-    ]
-
-    if hasattr(tokenizer, "apply_chat_template"):
-        return tokenizer.apply_chat_template(
-            raw_messages,
-            tokenize=False,
-            add_generation_prompt=True,
-        )
-
-    return (
-        "\n".join(
-            f"{message.role}: {chat_content_to_text(message.content)}"
-            for message in messages
-        )
-        + "\nassistant:"
+def to_chat_messages(request: ResponsesRequest) -> tuple[list[dict[str, str]], list[str]]:
+    """Flatten Responses input into text-only chat messages plus a list of image URLs."""
+    items = (
+        [InputMessage(role="user", content=request.input)]
+        if isinstance(request.input, str)
+        else request.input
     )
 
+    messages = []
+    images = []
 
-def openai_chat_response(
+    if request.instructions:
+        messages.append({"role": "system", "content": request.instructions})
+
+    for item in items:
+        if isinstance(item.content, str):
+            messages.append({"role": item.role, "content": item.content})
+            continue
+
+        texts = []
+        for part in item.content:
+            if part.type == "input_text":
+                texts.append(part.text)
+            elif part.type == "input_image":
+                images.append(part.image_url)
+        messages.append({"role": item.role, "content": "\n".join(texts)})
+
+    return messages, images
+
+
+async def stream_mlx_generate(
     *,
-    model: str,
-    content: str,
-    prompt_tokens: int | None = None,
-    completion_tokens: int | None = None,
+    model_name: str,
+    messages: list[dict[str, str]],
+    images: list[Image.Image],
+    max_tokens: int,
+) -> AsyncIterator[str]:
+    async with active_model.session():
+        model, processor, config = await active_model.load(
+            model_name, lambda: (*load(model_name), load_config(model_name))
+        )
+        prompt = apply_chat_template(processor, config, messages, num_images=len(images))
+
+        chunks = stream_generate(
+            model, processor, prompt, images or None, max_tokens=max_tokens
+        )
+        # Each step runs on the single MLX thread; the lock is held until the stream ends.
+        while (chunk := await run_on_mlx_thread(next, chunks, None)) is not None:
+            if chunk.text:
+                yield chunk.text
+
+
+def response_object(
+    *, response_id: str, message_id: str, model: str, text: str | None
 ) -> dict[str, Any]:
-    return {
-        "id": f"chatcmpl-{uuid.uuid4().hex}",
-        "object": "chat.completion",
-        "created": now_unix(),
-        "model": model,
-        "choices": [
+    output = []
+    if text is not None:
+        output.append(
             {
-                "index": 0,
-                "message": {
-                    "role": "assistant",
-                    "content": content,
-                },
-                "finish_reason": "stop",
+                "type": "message",
+                "id": message_id,
+                "status": "completed",
+                "role": "assistant",
+                "content": [{"type": "output_text", "text": text, "annotations": []}],
             }
-        ],
-        "usage": {
-            "prompt_tokens": prompt_tokens or 0,
-            "completion_tokens": completion_tokens or 0,
-            "total_tokens": (prompt_tokens or 0) + (completion_tokens or 0),
-        },
+        )
+
+    return {
+        "id": response_id,
+        "object": "response",
+        "created_at": now_unix(),
+        "status": "completed" if text is not None else "in_progress",
+        "model": model,
+        "output": output,
     }
 
 
-def openai_completion_response(*, model: str, text: str) -> dict[str, Any]:
-    return {
-        "id": f"cmpl-{uuid.uuid4().hex}",
-        "object": "text_completion",
-        "created": now_unix(),
-        "model": model,
-        "choices": [
-            {
-                "index": 0,
-                "text": text,
-                "finish_reason": "stop",
-            }
-        ],
-        "usage": {
-            "prompt_tokens": 0,
-            "completion_tokens": 0,
-            "total_tokens": 0,
-        },
-    }
+async def stream_response_events(
+    *, chunks: AsyncIterator[str], response_id: str, message_id: str, model: str
+) -> AsyncIterator[str]:
+    sequence = itertools.count()
 
+    def event(type_: str, **fields: Any) -> str:
+        payload = {"type": type_, "sequence_number": next(sequence), **fields}
+        return f"event: {type_}\ndata: {json.dumps(payload)}\n\n"
 
-async def run_mlx_chat_generate(
-    *,
-    model_name: str,
-    messages: list[ChatMessage],
-    max_tokens: int,
-    temperature: float,
-) -> str:
-    request_id = uuid.uuid4().hex
+    ids = {"response_id": response_id, "message_id": message_id, "model": model}
 
-    await active_mlx_model.acquire_for_request(request_id)
-    try:
-        model, tokenizer = await active_mlx_model.load_for_request(model_name)
-        prompt = chat_messages_to_prompt(tokenizer, messages)
+    yield event("response.created", response=response_object(**ids, text=None))
 
-        return await run_on_text_mlx_thread(
-            generate,
-            model,
-            tokenizer,
-            prompt=prompt,
-            max_tokens=max_tokens,
-            # temp=temperature,
-            verbose=False,
+    text = ""
+    async for delta in chunks:
+        text += delta
+        yield event(
+            "response.output_text.delta",
+            item_id=message_id,
+            output_index=0,
+            content_index=0,
+            delta=delta,
+            logprobs=[],
         )
-    finally:
-        active_mlx_model.release_request()
 
-
-async def run_mlx_completion_generate(
-    *,
-    model_name: str,
-    prompt: str,
-    max_tokens: int,
-    temperature: float,
-) -> str:
-    request_id = uuid.uuid4().hex
-
-    await active_mlx_model.acquire_for_request(request_id)
-    try:
-        model, tokenizer = await active_mlx_model.load_for_request(model_name)
-
-        return await run_on_text_mlx_thread(
-            generate,
-            model,
-            tokenizer,
-            prompt=prompt,
-            max_tokens=max_tokens,
-            temp=temperature,
-            verbose=False,
-        )
-    finally:
-        active_mlx_model.release_request()
+    yield event("response.completed", response=response_object(**ids, text=text))
 
 
 @app.get("/health")
 async def health():
     return {
         "status": "ok",
-        "mlx": {
-            "active_model": active_mlx_model.model_name,
-            "busy": active_mlx_model.lock.locked(),
-            "active_request_id": active_mlx_model.active_request_id,
-            "waiting_requests": active_mlx_model.waiting_requests,
+        "model": {
+            "active": active_model.name,
+            "busy": active_model.lock.locked(),
+            "active_request_id": active_model.active_request_id,
+            "waiting_requests": active_model.waiting_requests,
         },
         "image": {
             "default_model": DEFAULT_IMAGE_MODEL,
             "supported_models": list(SUPPORTED_IMAGE_MODELS.keys()),
-            "active_model": (
-                active_image_pipeline.model_name or active_mflux_image_model.model_name
-            ),
-            "active_backend": (
-                "diffusers"
-                if active_image_pipeline.model_name is not None
-                else "mflux"
-                if active_mflux_image_model.model_name is not None
-                else None
-            ),
-            "busy": active_image_pipeline.lock.locked(),
-            "active_request_id": active_image_pipeline.active_request_id,
-            "waiting_requests": active_image_pipeline.waiting_requests,
         },
     }
 
 
-
-@app.post("/v1/chat/completions")
-async def chat_completions(request: ChatCompletionRequest):
-    model_name = request.model
-
-    if request.stream:
-        return StreamingResponse(
-            stream_chat_completion_chunks(
-                model_name=model_name,
-                messages=request.messages,
-                max_tokens=request.max_tokens,
-                temperature=request.temperature,
-            ),
-            media_type="text/event-stream",
-        )
-
-    content = await run_mlx_chat_generate(
-        model_name=model_name,
-        messages=request.messages,
-        max_tokens=request.max_tokens,
-        temperature=request.temperature,
+@app.post("/v1/responses")
+async def responses(request: ResponsesRequest):
+    messages, image_urls = to_chat_messages(request)
+    images = await asyncio.gather(
+        *(asyncio.to_thread(fetch_image, url) for url in image_urls)
     )
 
-    return openai_chat_response(
-        model=model_name,
-        content=content,
-    )
-
-
-@app.post("/v1/completions")
-async def completions(request: CompletionRequest):
-    model_name = request.model
-
-    if request.stream:
-        return StreamingResponse(
-            stream_completion_chunks(
-                model_name=model_name,
-                prompt=request.prompt,
-                max_tokens=request.max_tokens,
-                temperature=request.temperature,
-            ),
-            media_type="text/event-stream",
-        )
-
-    text = await run_mlx_completion_generate(
-        model_name=model_name,
-        prompt=request.prompt,
-        max_tokens=request.max_tokens,
-        temperature=request.temperature,
-    )
-
-    return openai_completion_response(
-        model=model_name,
-        text=text,
-    )
-
-
-async def stream_chat_completion_chunks(
-    *,
-    model_name: str,
-    messages: list[ChatMessage],
-    max_tokens: int,
-    temperature: float,
-):
-    completion_id = f"chatcmpl-{uuid.uuid4().hex}"
-    created = now_unix()
-
-    content = await run_mlx_chat_generate(
-        model_name=model_name,
+    chunks = stream_mlx_generate(
+        model_name=request.model,
         messages=messages,
-        max_tokens=max_tokens,
-        temperature=temperature,
+        images=images,
+        max_tokens=request.max_output_tokens,
     )
-
-    payload = {
-        "id": completion_id,
-        "object": "chat.completion.chunk",
-        "created": created,
-        "model": model_name,
-        "choices": [
-            {
-                "index": 0,
-                "delta": {
-                    "content": content,
-                },
-                "finish_reason": None,
-            }
-        ],
+    ids = {
+        "response_id": f"resp_{uuid.uuid4().hex}",
+        "message_id": f"msg_{uuid.uuid4().hex}",
+        "model": request.model,
     }
 
-    yield f"data: {json.dumps(payload)}\n\n"
+    if request.stream:
+        return StreamingResponse(
+            stream_response_events(chunks=chunks, **ids),
+            media_type="text/event-stream",
+        )
 
-    done_payload = {
-        "id": completion_id,
-        "object": "chat.completion.chunk",
-        "created": created,
-        "model": model_name,
-        "choices": [
-            {
-                "index": 0,
-                "delta": {},
-                "finish_reason": "stop",
-            }
-        ],
-    }
-
-    yield f"data: {json.dumps(done_payload)}\n\n"
-    yield "data: [DONE]\n\n"
-
-
-async def stream_completion_chunks(
-    *,
-    model_name: str,
-    prompt: str,
-    max_tokens: int,
-    temperature: float,
-):
-    completion_id = f"cmpl-{uuid.uuid4().hex}"
-    created = now_unix()
-
-    text = await run_mlx_completion_generate(
-        model_name=model_name,
-        prompt=prompt,
-        max_tokens=max_tokens,
-        temperature=temperature,
-    )
-
-    payload = {
-        "id": completion_id,
-        "object": "text_completion",
-        "created": created,
-        "model": model_name,
-        "choices": [
-            {
-                "index": 0,
-                "text": text,
-                "finish_reason": None,
-            }
-        ],
-    }
-
-    yield f"data: {json.dumps(payload)}\n\n"
-
-    done_payload = {
-        "id": completion_id,
-        "object": "text_completion",
-        "created": created,
-        "model": model_name,
-        "choices": [
-            {
-                "index": 0,
-                "text": "",
-                "finish_reason": "stop",
-            }
-        ],
-    }
-
-    yield f"data: {json.dumps(done_payload)}\n\n"
-    yield "data: [DONE]\n\n"
+    text = "".join([chunk async for chunk in chunks])
+    return response_object(**ids, text=text)
 
 
 @app.post("/image/generate", response_class=StreamingResponse)
 async def image_generate(request: ImageGenerationRequest):
     model_name = resolve_image_model_name(request.model)
-    request_id = uuid.uuid4().hex
-
-    await active_image_pipeline.acquire_for_request(request_id)
 
     try:
-        if SUPPORTED_IMAGE_MODELS[model_name].get("backend") == "mflux":
-            await active_image_pipeline.unload()
-
-            model = await active_mflux_image_model.load_for_request(model_name)
-
-            image = await run_on_image_mlx_thread(
+        async with active_model.session():
+            model = await active_model.load(
+                model_name, lambda: load_mflux_model_sync(model_name)
+            )
+            image = await run_on_mlx_thread(
                 run_mflux_image_generation_sync,
                 model,
                 model_name,
                 request,
             )
-
-            return StreamingResponse(
-                image_to_png_stream(image),
-                media_type="image/png",
-            )
-
-        await active_mflux_image_model.unload()
-
-        pipe = await active_image_pipeline.load_for_request(model_name)
-
-        image = await asyncio.to_thread(
-            run_image_generation_sync,
-            pipe,
-            model_name,
-            request,
-        )
-
-        return StreamingResponse(
-            image_to_png_stream(image),
-            media_type="image/png",
-        )
-
     except Exception as e:
         print("\n=== ERROR GENERATING IMAGE ===")
         traceback.print_exc()
         raise HTTPException(status_code=500, detail=str(e))
 
-    finally:
-        active_image_pipeline.release_request()
+    return StreamingResponse(image_to_png_stream(image), media_type="image/png")
 
 
 if __name__ == "__main__":

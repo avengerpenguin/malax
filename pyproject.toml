@@ -9,6 +9,7 @@ name = "malax"
 dependencies = [
     "langchain >= 1.4.0",
     "mlx-lm",
+    "mlx-vlm",
     "mlx",
     "mflux",
     "fastapi",
@@ -22,8 +23,9 @@ test = [
     "pytest",
     "pytest-asyncio",
     "pytest-pikachu",
+    "pytest-xdist",
 ]
 
 [tool.pytest]
-addopts = ["--pikachu"]
+addopts = ["--pikachu", "-n", "auto"]
 testpaths = ["tests"]
