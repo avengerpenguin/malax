@@ -1,31 +1,3 @@
-import sys
-
-from openai import OpenAI
-from fastapi.testclient import TestClient
-import pytest
-
-
-@pytest.fixture
-def server():
-    from malax.server import app
-    return app
-
-
-@pytest.fixture
-def http_client(server):
-    with TestClient(server) as c:
-        yield c
-
-
-@pytest.fixture
-def client(http_client):
-    return OpenAI(
-        api_key="dummy",
-        base_url="http://testserver/v1",
-        http_client=http_client,
-    )
-
-
 def test_responses(client):
     response = client.responses.create(
         model="mlx-community/Qwen3.5-4B-MLX-4bit",

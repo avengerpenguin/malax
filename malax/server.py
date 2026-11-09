@@ -1,9 +1,14 @@
 import asyncio
+import base64
 import gc
+import importlib
 import io
 import itertools
 import json
 import os
+import random
+import re
+import tempfile
 import time
 import traceback
 import uuid
@@ -11,92 +16,25 @@ from collections.abc import AsyncIterator, Callable
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any
 
 import mlx.core as mx
 import requests
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import StreamingResponse
+from mflux.models.common.config import ModelConfig
 from mlx_vlm import load, stream_generate
 from mlx_vlm.prompt_utils import apply_chat_template
 from mlx_vlm.utils import load_config
 from PIL import Image
-from pydantic import BaseModel
-from mflux.models.common.config import ModelConfig
-from mflux.models.krea2 import Krea2
-from mflux.models.qwen.variants.txt2img.qwen_image import QwenImage
-from mflux.models.qwen21.variants.txt2img.qwen_image_21 import QwenImage21
-from mflux.models.z_image import ZImage
-from mflux.models.flux3.variants import Flux3Klein
+from pydantic import BaseModel, Field, ValidationError
+from starlette.datastructures import UploadFile
 
-
-SUPPORTED_IMAGE_MODELS = {
-    "z-image": {
-        "backend": "mflux",
-        "model_class": ZImage,
-        "model_config_factory": lambda: ModelConfig.z_image_turbo(),
-        "quantize": int(os.getenv("Z_IMAGE_MFLUX_QUANTIZE", "8")),
-        "default_width": 768,
-        "default_height": 1024,
-        "default_steps": 3,
-        "default_guidance": None,
-        "supports_negative_prompt": True,
-    },
-    "krea2": {
-        "backend": "mflux",
-        "model_class": Krea2,
-        "model_config_factory": lambda: ModelConfig.krea2(),
-        "quantize": int(os.getenv("KREA2_MFLUX_QUANTIZE", "4")),
-        "default_width": 768,
-        "default_height": 1024,
-        "default_steps": 8,
-        "default_guidance": 1.5,
-        "supports_negative_prompt": True,
-    },
-    "flux3": {
-        "backend": "mflux",
-        "model_class": Flux3Klein,
-        "model_config_factory": lambda: ModelConfig.flux3_image_klein(),
-        "quantize": int(os.getenv("FLUX3_MFLUX_QUANTIZE", "4")),
-        "default_width": 768,
-        "default_height": 1024,
-        "default_steps": 16,
-        "default_guidance": 1.5,
-        "supports_negative_prompt": False,
-    },
-    "qwen": {
-        "backend": "mflux",
-        "model_class": QwenImage,
-        "model_config_factory": lambda: ModelConfig.qwen_image(),
-        "quantize": int(os.getenv("QWEN_IMAGE_MFLUX_QUANTIZE", "4")),
-        "default_width": 768,
-        "default_height": 1024,
-        "default_steps": 4,
-        "default_guidance": 4.0,
-        "supports_negative_prompt": True,
-    },
-    "qwen21": {
-        "backend": "mflux",
-        "model_class": QwenImage21,
-        "model_config_factory": lambda: ModelConfig.qwen_image_21(),
-        "quantize": int(os.getenv("QWEN21_MFLUX_QUANTIZE", "4")),
-        "default_width": 1024,
-        "default_height": 1024,
-        "default_steps": 20,
-        "default_guidance": 4.5,
-        "supports_negative_prompt": True,
-    },
-}
-
-DEFAULT_IMAGE_MODEL = os.getenv("DEFAULT_IMAGE_MODEL", "sdxl")
-
-DEFAULT_NEGATIVE_PROMPT = (
-    "3d render, cg, digital art, illustration, painting, anime, deformed, mutated, bad anatomy, "
-    "bad hands, missing fingers, extra limbs, blurry, smooth skin, plastic skin, oversaturated, "
-    "airbrushed, drawing, watermark, text"
-)
 
 USER_AGENT = os.getenv("HTTP_USER_AGENT", "malax/0.1 (local ML gateway)")
+
+EXAMPLE_IMAGE_MODEL = "flux2.variants.Flux2Klein/flux2_klein_base_4b"
 
 mlx_executor: ThreadPoolExecutor | None = None
 
@@ -193,14 +131,23 @@ class ResponsesRequest(BaseModel):
 
 
 class ImageGenerationRequest(BaseModel):
-    model: str = DEFAULT_IMAGE_MODEL
+    model: str
     prompt: str
-    negative_prompt: str = ""
-    steps: int = 25
-    guidance_scale: float = 7.5
-    width: int = 1024
-    height: int = 1024
-    seed: int | None = 42
+    n: int = Field(1, ge=1, le=10)
+    size: str = "1024x1024"
+    response_format: str = "b64_json"
+
+    # mflux extensions; send these via `extra_body` from the OpenAI SDK.
+    seed: int | None = None
+    steps: int | None = None
+    guidance: float | None = None
+    negative_prompt: str | None = None
+    quantize: int | None = None
+
+
+class ImageEditRequest(ImageGenerationRequest):
+    # "auto" lets mflux size the output from the input images.
+    size: str = "auto"
 
 
 @asynccontextmanager
@@ -208,10 +155,7 @@ async def lifespan(app: FastAPI):
     global mlx_executor
 
     mlx_executor = ThreadPoolExecutor(max_workers=1)
-
     print("Local ML gateway starting")
-    print(f"Supported image models: {list(SUPPORTED_IMAGE_MODELS.keys())}")
-    print(f"Default image model: {DEFAULT_IMAGE_MODEL}")
 
     yield
 
@@ -225,95 +169,120 @@ app = FastAPI(
 )
 
 
-def resolve_image_model_name(requested_model: str | None) -> str:
-    model_name = requested_model or DEFAULT_IMAGE_MODEL
-    model_name = model_name.lower()
-
-    aliases = {
-        "zimage": "z-image",
-        "z-image-turbo": "z-image",
-        "krea": "krea2",
-        "krea-2": "krea2",
-        "qwen": "qwen",
-        "qwen-image": "qwen",
-        "qwen-image-2.1": "qwen21",
-        "qwen2.1": "qwen21",
-        "qwen-2.1": "qwen21",
-    }
-    model_name = aliases.get(model_name, model_name)
-
-    if model_name not in SUPPORTED_IMAGE_MODELS:
-        raise HTTPException(
-            status_code=400,
-            detail={
-                "message": f"Unsupported image model: {model_name}",
-                "supported_models": list(SUPPORTED_IMAGE_MODELS.keys()),
-            },
-        )
-
-    return model_name
-
-
-def image_to_pil_image(image: Any) -> Image.Image:
-    if isinstance(image, Image.Image):
-        return image
-
-    for attr_name in ("image", "pil_image", "pil", "_image"):
-        nested_image = getattr(image, attr_name, None)
-        if isinstance(nested_image, Image.Image):
-            return nested_image
-
-    raise TypeError(f"Unsupported image result type: {type(image)!r}")
-
-
-def image_to_png_stream(image: Any) -> io.BytesIO:
-    pil_image = image_to_pil_image(image)
-
-    img_byte_arr = io.BytesIO()
-    pil_image.save(img_byte_arr, format="PNG")
-    img_byte_arr.seek(0)
-    return img_byte_arr
-
-
-def load_mflux_model_sync(model_name: str) -> Any:
-    config = SUPPORTED_IMAGE_MODELS[model_name]
-    return config["model_class"](
-        quantize=config["quantize"],
-        model_config=config["model_config_factory"](),
+def model_config_names() -> list[str]:
+    return sorted(
+        name
+        for name, attr in vars(ModelConfig).items()
+        if isinstance(attr, (staticmethod, classmethod)) and not name.startswith("_")
     )
 
 
-def run_mflux_image_generation_sync(
-    model: Any,
-    model_name: str,
-    request: ImageGenerationRequest,
-):
-    config = SUPPORTED_IMAGE_MODELS[model_name]
+def resolve_mflux_model(spec: str) -> tuple[type, Callable[[], ModelConfig]]:
+    """Resolve '<module>.<Class>/<config>' to an mflux model class and ModelConfig factory."""
+    class_path, slash, config_name = spec.partition("/")
+    module_path, _, class_name = class_path.rpartition(".")
 
-    width = request.width if request.width != 1024 else config["default_width"]
-    height = request.height if request.height != 1024 else config["default_height"]
-    steps = request.steps if request.steps != 25 else config["default_steps"]
-
-    kwargs = {
-        "seed": request.seed if request.seed is not None else 42,
-        "prompt": request.prompt,
-        "num_inference_steps": steps,
-        "width": width,
-        "height": height,
-    }
-
-    default_guidance = config.get("default_guidance")
-    if default_guidance is not None:
-        kwargs["guidance"] = (
-            request.guidance_scale
-            if request.guidance_scale != 7.5
-            else default_guidance
+    if not slash or not module_path or not config_name:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Image model must look like '<module>.<Class>/<config>', "
+            f"e.g. '{EXAMPLE_IMAGE_MODEL}'",
         )
 
-    if config.get("supports_negative_prompt"):
-        kwargs["negative_prompt"] = request.negative_prompt or DEFAULT_NEGATIVE_PROMPT
+    try:
+        module = importlib.import_module(f"mflux.models.{module_path}")
+        model_class = getattr(module, class_name)
+    except (ImportError, AttributeError) as e:
+        raise HTTPException(
+            status_code=400, detail=f"Unknown mflux model class '{class_path}': {e}"
+        )
 
-    return model.generate_image(**kwargs)
+    factory = getattr(ModelConfig, config_name.replace("-", "_"), None)
+    if not callable(factory):
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "message": f"Unknown ModelConfig '{config_name}'",
+                "available": model_config_names(),
+            },
+        )
+
+    return model_class, factory
+
+
+def parse_size(size: str) -> tuple[int, int]:
+    if size == "auto":
+        return 1024, 1024
+
+    match = re.fullmatch(r"(\d+)x(\d+)", size)
+    if not match:
+        raise HTTPException(
+            status_code=400, detail=f"Invalid size '{size}', expected WIDTHxHEIGHT"
+        )
+
+    return int(match[1]), int(match[2])
+
+
+def png_base64(image: Image.Image) -> str:
+    buffer = io.BytesIO()
+    image.save(buffer, format="PNG")
+    return base64.b64encode(buffer.getvalue()).decode()
+
+
+def generate_images_sync(
+    model: Any, request: ImageGenerationRequest, **inputs: Any
+) -> list[str]:
+    seed = request.seed if request.seed is not None else random.randrange(2**32)
+
+    # Only pass what the client set, so mflux applies its own per-model defaults.
+    options = {
+        name: value
+        for name, value in {
+            "num_inference_steps": request.steps,
+            "guidance": request.guidance,
+            "negative_prompt": request.negative_prompt,
+        }.items()
+        if value is not None
+    }
+
+    return [
+        png_base64(
+            model.generate_image(
+                seed=seed + i,
+                prompt=request.prompt,
+                **inputs,
+                **options,
+            ).image
+        )
+        for i in range(request.n)
+    ]
+
+
+async def run_mflux(request: ImageGenerationRequest, **inputs: Any) -> dict[str, Any]:
+    """Load the requested mflux model and generate images; shared by generations and edits."""
+    if request.response_format != "b64_json":
+        raise HTTPException(status_code=400, detail="Only response_format=b64_json is supported")
+
+    model_class, config_factory = resolve_mflux_model(request.model)
+
+    # Quantization changes the loaded weights, so it is part of the model identity.
+    model_key = f"{request.model}?quantize={request.quantize}"
+
+    try:
+        async with active_model.session():
+            model = await active_model.load(
+                model_key,
+                lambda: model_class(quantize=request.quantize, model_config=config_factory()),
+            )
+            images = await run_on_mlx_thread(generate_images_sync, model, request, **inputs)
+    except Exception as e:
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail=str(e))
+
+    return {
+        "created": now_unix(),
+        "data": [{"b64_json": image} for image in images],
+    }
 
 
 def now_unix() -> int:
@@ -478,10 +447,6 @@ async def health():
             "active_request_id": active_model.active_request_id,
             "waiting_requests": active_model.waiting_requests,
         },
-        "image": {
-            "default_model": DEFAULT_IMAGE_MODEL,
-            "supported_models": list(SUPPORTED_IMAGE_MODELS.keys()),
-        },
     }
 
 
@@ -513,27 +478,42 @@ async def responses(request: ResponsesRequest):
     return response_object(**ids, text=text, truncated=truncated)
 
 
-@app.post("/image/generate", response_class=StreamingResponse)
-async def image_generate(request: ImageGenerationRequest):
-    model_name = resolve_image_model_name(request.model)
+@app.post("/v1/images/generations")
+async def images_generations(request: ImageGenerationRequest):
+    width, height = parse_size(request.size)
+    return await run_mflux(request, width=width, height=height)
 
+
+@app.post("/v1/images/edits")
+async def images_edits(http_request: Request):
+    form = await http_request.form()
+
+    # The OpenAI SDK sends a list of images as `image[]` and a single image as `image`.
+    uploads = form.getlist("image[]") or form.getlist("image")
+    if not uploads or not all(isinstance(u, UploadFile) for u in uploads):
+        raise HTTPException(status_code=400, detail="At least one image file is required")
+    if "mask" in form:
+        raise HTTPException(status_code=400, detail="mask is not supported")
+
+    fields = {k: v for k, v in form.items() if not isinstance(v, UploadFile)}
     try:
-        async with active_model.session():
-            model = await active_model.load(
-                model_name, lambda: load_mflux_model_sync(model_name)
-            )
-            image = await run_on_mlx_thread(
-                run_mflux_image_generation_sync,
-                model,
-                model_name,
-                request,
-            )
-    except Exception as e:
-        print("\n=== ERROR GENERATING IMAGE ===")
-        traceback.print_exc()
-        raise HTTPException(status_code=500, detail=str(e))
+        request = ImageEditRequest(**fields)
+    except ValidationError as e:
+        raise HTTPException(status_code=422, detail=e.errors())
 
-    return StreamingResponse(image_to_png_stream(image), media_type="image/png")
+    inputs = {}
+    if request.size != "auto":
+        inputs["width"], inputs["height"] = parse_size(request.size)
+
+    # mflux edit models take file paths, so stage the uploads on disk for the request.
+    with tempfile.TemporaryDirectory() as tmp:
+        paths = []
+        for i, upload in enumerate(uploads):
+            path = Path(tmp) / f"{i}{Path(upload.filename or '').suffix or '.png'}"
+            path.write_bytes(await upload.read())
+            paths.append(str(path))
+
+        return await run_mflux(request, image_paths=paths, **inputs)
 
 
 if __name__ == "__main__":
