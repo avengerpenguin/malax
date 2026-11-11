@@ -1,5 +1,7 @@
 import base64
 from pathlib import Path
+import openai
+import pytest
 
 SEED = 1729
 SIZE = "512x512"
@@ -62,6 +64,25 @@ def test_image_edit(client):
         )
     save(result, "painting.png")
 
+def test_image_edit_zimage(client):
+    with open(HERE / "car.png", "rb") as car:
+        result = client.images.edit(
+            model="z_image.ZImage/z_image_turbo",
+            image=[car],
+            prompt="A watercolour painting of a car",
+            size=SIZE,
+            extra_body={"seed": SEED, "steps": 6, "image_strength": 0.5, "quantize": 8},
+        )
+    save(result, "car_watercolour.png")
+
+
+def test_image_edit_rejects_non_image(client):
+    with pytest.raises(openai.BadRequestError):
+        client.images.edit(
+            model="z_image.ZImage/z_image_turbo",
+            image=("notes.txt", b"not an image", "text/plain"),
+            prompt="anything",
+        )
 
 def test_image_edit_lora(client):
     with open(HERE / "car.png", "rb") as car:
