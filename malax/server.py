@@ -1,7 +1,6 @@
 import asyncio
 import base64
 import binascii
-import gc
 import io
 import itertools
 import json
@@ -9,24 +8,19 @@ import os
 import time
 import urllib.parse
 import uuid
-import weakref
-from collections.abc import AsyncIterator, Callable
+from collections.abc import AsyncIterator
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import asynccontextmanager
-from dataclasses import dataclass
 from pathlib import Path
 from typing import Annotated, Any
 
 import mlx.core as mx
 import requests
+from PIL import Image
 from fastapi import Depends, FastAPI, HTTPException, Request
 from fastapi.responses import StreamingResponse, FileResponse
 from huggingface_hub import scan_cache_dir
 from huggingface_hub.utils import CacheNotFound
-from mlx_vlm import load, stream_generate
-from mlx_vlm.prompt_utils import apply_chat_template
-from mlx_vlm.utils import load_config
-from PIL import Image
 from pydantic import BaseModel, ValidationError
 from starlette.datastructures import UploadFile
 from starlette.formparsers import MultiPartParser
@@ -38,7 +32,8 @@ from malax.mflux_runner import (
     models_for_repo,
     run_mflux,
 )
-
+from malax.mlx_runtime import ActiveModel
+from malax.vlm_runner import GenerationStats, stream_mlx_generate
 
 USER_AGENT = os.getenv("HTTP_USER_AGENT", "malax/0.1 (local ML gateway)")
 # MLX keeps freed buffers for reuse; uncapped, that cache can be as big as the model itself.
@@ -47,100 +42,6 @@ MAX_UPLOAD_BYTES = int(float(os.getenv("MAX_UPLOAD_MB", "50")) * 1024**2)
 # Starlette spools uploads over 1MB to a temp file. Images must never touch the disk, so raise the
 # threshold to the request cap; images_edits rejects anything bigger before parsing the form.
 MultiPartParser.spool_max_size = MAX_UPLOAD_BYTES
-
-
-async def run_on_mlx_thread(executor: ThreadPoolExecutor, func, *args, **kwargs):
-    loop = asyncio.get_running_loop()
-    return await loop.run_in_executor(executor, lambda: func(*args, **kwargs))
-
-
-def clear_mlx_cache_sync():
-    gc.collect()
-    mx.clear_cache()
-    mx.reset_peak_memory()
-
-
-def load_sync(loader: Callable[[], Any]) -> Any:
-    model = loader()
-    # Free intermediates from loading (e.g. LoRA baking) before generation needs the memory.
-    gc.collect()
-    mx.clear_cache()
-    return model
-
-
-def memory_stats() -> str:
-    gb = 1024**3
-    return (
-        f"active={mx.get_active_memory() / gb:.1f}GB "
-        f"cache={mx.get_cache_memory() / gb:.1f}GB "
-        f"peak={mx.get_peak_memory() / gb:.1f}GB"
-    )
-
-
-class ActiveModel:
-    """Holds at most one model (chat or image) in memory at a time."""
-
-    def __init__(self, executor: ThreadPoolExecutor):
-        # MLX work must stay on this one thread; the lock below serialises use of it.
-        self.executor = executor
-        self.name: str | None = None
-        self.model: Any | None = None
-        self.lock = asyncio.Lock()
-        self.waiting_requests: int = 0
-
-    async def run(self, func, *args, **kwargs):
-        return await run_on_mlx_thread(self.executor, func, *args, **kwargs)
-
-    @asynccontextmanager
-    async def session(self):
-        self.waiting_requests += 1
-        try:
-            await self.lock.acquire()
-        finally:
-            self.waiting_requests -= 1
-
-        try:
-            yield
-        finally:
-            self.lock.release()
-
-    async def load(self, name: str, loader: Callable[[], Any]) -> Any:
-        if self.name == name:
-            return self.model
-
-        await self.unload()
-
-        print(f"Loading model: {name}")
-        self.model = await self.run(load_sync, loader)
-        self.name = name
-        print(f"Loaded model: {name} ({memory_stats()})")
-
-        return self.model
-
-    async def unload(self):
-        if self.model is None:
-            return
-
-        print(f"Unloading model: {self.name} ({memory_stats()})")
-
-        # Chat models are a (model, processor, config) tuple; track the model itself.
-        target = self.model[0] if isinstance(self.model, tuple) else self.model
-        try:
-            ref = weakref.ref(target)
-        except TypeError:
-            ref = None
-        del target
-
-        self.model = None
-        self.name = None
-
-        await self.run(clear_mlx_cache_sync)
-
-        if ref is not None and (leaked := ref()) is not None:
-            holders = [type(r).__name__ for r in gc.get_referrers(leaked)]
-            print(f"WARNING: model still alive after unload, referenced by: {holders}")
-            del leaked
-        print(f"Unloaded ({memory_stats()})")
 
 
 class InputContent(BaseModel):
@@ -220,7 +121,7 @@ async def lifespan(app: FastAPI):
 
 
 app = FastAPI(
-    title="Local ML Gateway",
+    title="MaLaX: Local MLX Gateway",
     lifespan=lifespan,
 )
 
@@ -407,62 +308,6 @@ async def fetch_images(urls: list[str]) -> list[Image.Image]:
     return list(
         await asyncio.gather(*(asyncio.to_thread(fetch_image, url) for url in urls))
     )
-
-
-@dataclass
-class GenerationStats:
-    tokens: int = 0
-    prompt_tokens: int = 0
-    finish_reason: str | None = None
-
-    def truncated(self, limit: int) -> bool:
-        # Prefer the library's own verdict; fall back to comparing against the limit.
-        if self.finish_reason is not None:
-            return self.finish_reason == "length"
-        return self.tokens >= limit
-
-
-async def stream_mlx_generate(
-    *,
-    active_model: ActiveModel,
-    model_name: str,
-    max_tokens: int,
-    temperature: float | None,
-    top_p: float | None,
-    messages: list[dict[str, str]],
-    images: list[Image.Image],
-    stats: GenerationStats,
-) -> AsyncIterator[str]:
-    async with active_model.session():
-        model, processor, config = await active_model.load(
-            model_name, lambda: (*load(model_name), load_config(model_name))
-        )
-        prompt = apply_chat_template(
-            processor, config, messages, num_images=len(images)
-        )
-
-        chunks = stream_generate(
-            model,
-            processor,
-            prompt,
-            images or None,
-            max_tokens=max_tokens,
-            temperature=temperature,
-            top_p=top_p,
-        )
-        # Each step runs on the single MLX thread; the lock is held until the stream ends.
-        while (chunk := await active_model.run(next, chunks, None)) is not None:
-            # Not one chunk per token: mlx_vlm yields an extra result after the loop to flush the
-            # detokenizer, so trust its own running count instead of counting chunks.
-            stats.tokens = getattr(chunk, "generation_tokens", None) or stats.tokens
-            stats.prompt_tokens = (
-                getattr(chunk, "prompt_tokens", 0) or stats.prompt_tokens
-            )
-            stats.finish_reason = (
-                getattr(chunk, "finish_reason", None) or stats.finish_reason
-            )
-            if chunk.text:
-                yield chunk.text
 
 
 def response_object(

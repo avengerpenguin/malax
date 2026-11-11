@@ -13,7 +13,7 @@ import time
 import traceback
 from collections.abc import Callable
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any, Literal
+from typing import Any, Literal
 
 from fastapi import HTTPException
 from mflux.models.common.config import ModelConfig
@@ -21,9 +21,7 @@ from mflux.models.common.config.model_config import AVAILABLE_MODELS
 from PIL import Image
 from pydantic import BaseModel, Field, model_validator
 
-if TYPE_CHECKING:
-    # Type-only: server.py imports this module, so a runtime import would be circular.
-    from malax.server import ActiveModel
+from malax.mlx_runtime import ActiveModel
 
 
 SIZE_PATTERN = r"^(auto|\d+x\d+)$"
