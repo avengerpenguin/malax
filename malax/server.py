@@ -2,16 +2,11 @@ import asyncio
 import base64
 import binascii
 import gc
-import importlib
-import inspect
 import io
 import itertools
 import json
-import math
 import os
-import random
 import time
-import traceback
 import urllib.parse
 import uuid
 import weakref
@@ -19,23 +14,30 @@ from collections.abc import AsyncIterator, Callable
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
-from typing import Any, Literal
+from pathlib import Path
+from typing import Annotated, Any
 
 import mlx.core as mx
 import requests
-from fastapi import FastAPI, HTTPException, Request
-from fastapi.responses import StreamingResponse
+from fastapi import Depends, FastAPI, HTTPException, Request
+from fastapi.responses import StreamingResponse, FileResponse
 from huggingface_hub import scan_cache_dir
 from huggingface_hub.utils import CacheNotFound
-from mflux.models.common.config import ModelConfig
-from mflux.models.common.config.model_config import AVAILABLE_MODELS
 from mlx_vlm import load, stream_generate
 from mlx_vlm.prompt_utils import apply_chat_template
 from mlx_vlm.utils import load_config
 from PIL import Image
-from pydantic import BaseModel, Field, ValidationError, model_validator
+from pydantic import BaseModel, ValidationError
 from starlette.datastructures import UploadFile
 from starlette.formparsers import MultiPartParser
+
+from malax.mflux_runner import (
+    ImageEditRequest,
+    ImageGenerationRequest,
+    ImageTask,
+    models_for_repo,
+    run_mflux,
+)
 
 
 USER_AGENT = os.getenv("HTTP_USER_AGENT", "malax/0.1 (local ML gateway)")
@@ -78,11 +80,16 @@ def memory_stats() -> str:
 class ActiveModel:
     """Holds at most one model (chat or image) in memory at a time."""
 
-    def __init__(self):
+    def __init__(self, executor: ThreadPoolExecutor):
+        # MLX work must stay on this one thread; the lock below serialises use of it.
+        self.executor = executor
         self.name: str | None = None
         self.model: Any | None = None
         self.lock = asyncio.Lock()
         self.waiting_requests: int = 0
+
+    async def run(self, func, *args, **kwargs):
+        return await run_on_mlx_thread(self.executor, func, *args, **kwargs)
 
     @asynccontextmanager
     async def session(self):
@@ -97,20 +104,20 @@ class ActiveModel:
         finally:
             self.lock.release()
 
-    async def load(self, executor: ThreadPoolExecutor, name: str, loader: Callable[[], Any]) -> Any:
+    async def load(self, name: str, loader: Callable[[], Any]) -> Any:
         if self.name == name:
             return self.model
 
-        await self.unload(executor)
+        await self.unload()
 
         print(f"Loading model: {name}")
-        self.model = await run_on_mlx_thread(executor, load_sync, loader)
+        self.model = await self.run(load_sync, loader)
         self.name = name
         print(f"Loaded model: {name} ({memory_stats()})")
 
         return self.model
 
-    async def unload(self, executor: ThreadPoolExecutor):
+    async def unload(self):
         if self.model is None:
             return
 
@@ -127,16 +134,13 @@ class ActiveModel:
         self.model = None
         self.name = None
 
-        await run_on_mlx_thread(executor, clear_mlx_cache_sync)
+        await self.run(clear_mlx_cache_sync)
 
         if ref is not None and (leaked := ref()) is not None:
             holders = [type(r).__name__ for r in gc.get_referrers(leaked)]
             print(f"WARNING: model still alive after unload, referenced by: {holders}")
             del leaked
         print(f"Unloaded ({memory_stats()})")
-
-
-active_model = ActiveModel()
 
 
 class InputContent(BaseModel):
@@ -200,124 +204,18 @@ class ChatCompletionsRequest(BaseModel):
         return self.max_completion_tokens or self.max_tokens or DEFAULT_MAX_TOKENS
 
 
-SIZE_PATTERN = r"^(auto|\d+x\d+)$"
-
-# Request fields baked in when the model is constructed; changing any of them means a reload.
-LOAD_TIME_FIELDS = {"model", "quantize", "base_model", "lora_paths", "lora_scales"}
-
-
-class ImageGenerationRequest(BaseModel):
-    model: str
-    prompt: str
-    n: int = Field(1, ge=1, le=10)
-    size: str = Field("1024x1024", pattern=SIZE_PATTERN)
-    response_format: Literal["b64_json"] = "b64_json"
-
-    # mflux extensions; send these via `extra_body` from the OpenAI SDK.
-    seed: int | None = None
-    steps: int | None = None
-    guidance: float | None = None
-    negative_prompt: str | None = None
-    image_strength: float | None = None
-    quantize: int | None = None
-    base_model: str | None = None
-    lora_paths: list[str] = []
-    lora_scales: list[float] = []
-
-    @model_validator(mode="after")
-    def check_lora_scales(self):
-        if self.lora_scales and len(self.lora_scales) != len(self.lora_paths):
-            raise ValueError("lora_scales must have one entry per lora_paths entry")
-        return self
-
-    def model_key(self) -> str:
-        return json.dumps(self.model_dump(include=LOAD_TIME_FIELDS))
-
-    def size_kwargs(self, reference: Image.Image | None = None) -> dict[str, int]:
-        """For "auto", follow the reference image's aspect ratio at up to ~1MP, so mflux never reads it from a path."""
-        if self.size != "auto":
-            width, height = map(int, self.size.split("x"))
-            return {"width": width, "height": height}
-        if reference is None:
-            return {}
-        width, height = reference.size
-        scale = min(1.0, math.sqrt(1024 * 1024 / (width * height)))
-        return {
-            "width": max(16, int(width * scale) // 16 * 16),
-            "height": max(16, int(height * scale) // 16 * 16),
-        }
-
-
-class ImageEditRequest(ImageGenerationRequest):
-    size: str = Field("auto", pattern=SIZE_PATTERN)
-
-
-ImageTask = Literal["generate", "edit"]
-
-IMAGE_ENDPOINTS: dict[ImageTask, str] = {
-    "generate": "/v1/images/generations",
-    "edit": "/v1/images/edits",
-}
-
-# mflux has no mapping from a ModelConfig to the class that runs it, so map config-name
-# prefixes by hand. The longest prefix wins; add a row when you start using a new family.
-MFLUX_CLASSES: dict[str, dict[ImageTask, str]] = {
-    "flux2_klein": {
-        "generate": "flux2.variants.Flux2Klein",
-        "edit": "flux2.variants.Flux2KleinEdit",
-    },
-    "z_image": {"generate": "z_image.ZImage"},
-}
-
-
-def config_name(alias: str) -> str:
-    """Prefer the ModelConfig factory spelling (flux2_klein_4b), as used in the tests."""
-    name = alias.replace("-", "_")
-    return name if callable(getattr(ModelConfig, name, None)) else alias
-
-
-MFLUX_CONFIG_NAMES = {config_name(alias) for alias in AVAILABLE_MODELS}
-
-def config_preference(config: str) -> tuple[bool, int]:
-    """Sort key: ModelConfig factory spellings first, then the shortest alias."""
-    return (not callable(getattr(ModelConfig, config, None)), len(config))
-
-
-# HF repo id -> config name, e.g. "black-forest-labs/FLUX.2-klein-4B" -> "flux2_klein_4b".
-# Several aliases can share a repo (e.g. Tongyi-MAI/Z-Image-Turbo), so pick the best one.
-MFLUX_CONFIG_BY_REPO: dict[str, str] = {}
-for _alias, _config in AVAILABLE_MODELS.items():
-    _candidate = config_name(_alias)
-    _current = MFLUX_CONFIG_BY_REPO.get(_config.model_name)
-    if _current is None or config_preference(_candidate) < config_preference(_current):
-        MFLUX_CONFIG_BY_REPO[_config.model_name] = _candidate
-
-
-def mflux_classes(config: str) -> dict[ImageTask, str]:
-    normalized = config.replace("-", "_")
-    matches = [prefix for prefix in MFLUX_CLASSES if normalized.startswith(prefix)]
-    return MFLUX_CLASSES[max(matches, key=len)] if matches else {}
-
-
-def expand_image_model(name: str, task: ImageTask) -> str:
-    """Turn a bare config name or repo id into '<module>.<Class>/<config>'; leave anything else alone."""
-    config = config_name(MFLUX_CONFIG_BY_REPO.get(name, name))
-    if config not in MFLUX_CONFIG_NAMES:
-        return name
-    class_path = mflux_classes(config).get(task)
-    return f"{class_path}/{config}" if class_path else name
-
-
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     executor = ThreadPoolExecutor(max_workers=1)
+    active_model = ActiveModel(executor)
     app.state.mlx_executor = executor
+    app.state.active_model = active_model
     mx.set_cache_limit(int(MLX_CACHE_LIMIT_GB * 1024**3))
     print("Local ML gateway starting")
 
     yield
 
-    await active_model.unload(executor)
+    await active_model.unload()
     executor.shutdown(wait=True, cancel_futures=False)
 
 
@@ -327,198 +225,44 @@ app = FastAPI(
 )
 
 
-def model_config_names() -> list[str]:
-    return sorted(MFLUX_CONFIG_NAMES)
+def get_mlx_executor(request: Request) -> ThreadPoolExecutor:
+    return request.app.state.mlx_executor
 
 
-def mflux_loader(request: ImageGenerationRequest) -> tuple[type, Callable[[], Any]]:
-    """Resolve '<module>.<Class>/<config or repo>' into the class and a function that builds the model."""
-    class_path, _, config_name = request.model.partition("/")
-    module_path, _, class_name = class_path.rpartition(".")
-
-    if not module_path or not config_name:
-        raise HTTPException(
-            status_code=400,
-            detail=f"Invalid image model {request.model}.Image model must look like '<module>.<Class>/<config or repo>', "
-            "e.g. 'flux2.variants.Flux2Klein/flux2_klein_4b'",
-        )
-
-    try:
-        model_class = getattr(importlib.import_module(f"mflux.models.{module_path}"), class_name)
-    except (ImportError, AttributeError) as e:
-        raise HTTPException(status_code=400, detail=f"Unknown mflux model class '{class_path}': {e}")
-
-    # Only pass what the client set, so mflux applies its own defaults.
-    kwargs: dict[str, Any] = {
-        name: value
-        for name, value in {
-            "quantize": request.quantize,
-            "lora_paths": request.lora_paths,
-            "lora_scales": request.lora_scales,
-        }.items()
-        if value
-    }
-
-    factory = getattr(ModelConfig, config_name.replace("-", "_"), None)
-    if callable(factory):
-        kwargs["model_config"] = factory()
-    else:
-        # A HF repo id or local path: infer the architecture, take the weights from the repo.
-        try:
-            kwargs["model_config"] = ModelConfig.from_name(config_name, base_model=request.base_model)
-        except Exception as e:
-            raise HTTPException(
-                status_code=400,
-                detail={
-                    "message": f"Unknown ModelConfig, repo or path '{config_name}': {e}",
-                    "hint": "For third-party repos, set base_model in extra_body, e.g. 'flux2-klein-4b'",
-                    "available": model_config_names(),
-                },
-            )
-        kwargs["model_path"] = config_name
-
-    return model_class, lambda: model_class(**kwargs)
+def get_active_model(request: Request) -> ActiveModel:
+    return request.app.state.active_model
 
 
-# The mflux CLI's default. The Python API defaults to None, which skips the input image without an error.
-DEFAULT_IMAGE_STRENGTH = 0.4
-
-
-def default_steps(params: dict[str, inspect.Parameter]) -> int | None:
-    param = params.get("num_inference_steps")
-    return param.default if param is not None and isinstance(param.default, int) else None
-
-
-def image_inputs(request: ImageGenerationRequest, model_class: type, images: list[Image.Image]) -> dict[str, Any]:
-    """Pass in-memory input images the way this class's generate_image takes them; checked before loading."""
-    params = inspect.signature(model_class.generate_image).parameters
-
-    if not images:
-        if request.image_strength is not None:
-            raise HTTPException(status_code=400, detail="image_strength only applies to /v1/images/edits")
-        return {}
-
-    if request.image_strength is not None and "image_strength" not in params:
-        raise HTTPException(status_code=400, detail=f"'{request.model}' does not take image_strength")
-
-    # mflux's ImageUtil.load_image accepts PIL images as well as paths, despite the parameter names.
-    if "image_paths" in params:
-        return {"image_paths": images}
-
-    if "image_path" in params:
-        if len(images) != 1:
-            raise HTTPException(
-                status_code=400,
-                detail=f"'{request.model}' takes exactly one input image, got {len(images)}",
-            )
-
-        strength = request.image_strength if request.image_strength is not None else DEFAULT_IMAGE_STRENGTH
-        if not 0 < strength < 1:
-            raise HTTPException(status_code=400, detail="image_strength must be between 0 and 1 (exclusive)")
-
-        # img2img skips the first int(steps * strength) denoising steps; at 0 the image is ignored.
-        steps = request.steps if request.steps is not None else default_steps(params)
-        if steps is not None and int(steps * strength) < 1:
-            raise HTTPException(
-                status_code=400,
-                detail=f"steps={steps} with image_strength={strength} would ignore the input image; "
-                "raise one of them",
-            )
-
-        return {"image_path": images[0], "image_strength": strength}
-
-    raise HTTPException(
-        status_code=400,
-        detail=f"'{request.model}' does not accept input images; use /v1/images/generations",
-    )
-
-
-def png_base64(image: Image.Image) -> str:
-    buffer = io.BytesIO()
-    image.save(buffer, format="PNG")
-    return base64.b64encode(buffer.getvalue()).decode()
-
-
-def generate_images_sync(
-    model: Any, request: ImageGenerationRequest, size: dict[str, int], **inputs: Any
-) -> list[str]:
-    seed = request.seed if request.seed is not None else random.randrange(2**32)
-
-    # Only pass what the client set, so mflux applies its own per-model defaults.
-    options = {
-        name: value
-        for name, value in {
-            "num_inference_steps": request.steps,
-            "guidance": request.guidance,
-            "negative_prompt": request.negative_prompt,
-        }.items()
-        if value is not None
-    }
-
-    return [
-        png_base64(
-            model.generate_image(
-                seed=seed + i,
-                prompt=request.prompt,
-                **size,
-                **inputs,
-                **options,
-            ).image
-        )
-        for i in range(request.n)
-    ]
-
-
-async def run_mflux(
-    executor: ThreadPoolExecutor,
-    request: ImageGenerationRequest,
-    task: ImageTask,
-    images: list[Image.Image] | None = None,
-) -> dict[str, Any]:
-    """Load the requested mflux model and generate images; shared by generations and edits."""
-    images = images or []
-    request = request.model_copy(update={"model": expand_image_model(request.model, task)})
-    model_class, loader = mflux_loader(request)
-    inputs = image_inputs(request, model_class, images)
-    size = request.size_kwargs(images[0] if images else None)
-    if images:
-        described = {k: (f"<{len(v)} images>" if isinstance(v, list) else v) for k, v in inputs.items()}
-        print(f"Image inputs for {request.model}: {described}, sizes={[im.size for im in images]}, output={size}")
-
-    try:
-        async with active_model.session():
-            model = await active_model.load(executor, request.model_key(), loader)
-            images_b64 = await run_on_mlx_thread(executor, generate_images_sync, model, request, size, **inputs)
-    except Exception as e:
-        traceback.print_exc()
-        raise HTTPException(status_code=500, detail=str(e))
-
-    return {
-        "created": now_unix(),
-        "data": [{"b64_json": image} for image in images_b64],
-    }
+MlxExecutorDep = Annotated[ThreadPoolExecutor, Depends(get_mlx_executor)]
+ActiveModelDep = Annotated[ActiveModel, Depends(get_active_model)]
 
 
 def now_unix() -> int:
     return int(time.time())
 
 
-def active_model_id() -> str | None:
+IMAGE_ENDPOINTS: dict[ImageTask, str] = {
+    "generate": "/v1/images/generations",
+    "edit": "/v1/images/edits",
+}
+
+
+def active_model_id(name: str | None) -> str | None:
     """Image models are keyed by a JSON blob of load-time fields; chat models by repo id."""
     try:
-        return json.loads(active_model.name)["model"]
+        return json.loads(name)["model"]
     except (TypeError, ValueError, KeyError):
-        return active_model.name
+        return name
 
 
-def list_cached_models_sync() -> list[dict[str, Any]]:
+def list_cached_models_sync(active_name: str | None) -> list[dict[str, Any]]:
     """Model repos in the Hugging Face cache, shaped like OpenAI model objects."""
     try:
         cache = scan_cache_dir()
     except CacheNotFound:
         return []
 
-    active = active_model_id()
+    active = active_model_id(active_name)
     entries = []
 
     for repo in sorted(cache.repos, key=lambda r: r.repo_id.lower()):
@@ -529,22 +273,29 @@ def list_cached_models_sync() -> list[dict[str, Any]]:
         common = {
             "object": "model",
             "created": int(repo.last_modified),
-            "owned_by": repo.repo_id.partition("/")[0] if "/" in repo.repo_id else "local",
+            "owned_by": repo.repo_id.partition("/")[0]
+            if "/" in repo.repo_id
+            else "local",
             "repo_id": repo.repo_id,
             "size_on_disk": repo.size_on_disk,
         }
 
-        config = MFLUX_CONFIG_BY_REPO.get(repo.repo_id)
-        classes = mflux_classes(config) if config else {}
+        image_models = models_for_repo(repo.repo_id)
 
-        if not classes:
-            entries.append({"id": repo.repo_id, **common, "active": active == repo.repo_id})
+        if not image_models:
+            entries.append(
+                {"id": repo.repo_id, **common, "active": active == repo.repo_id}
+            )
             continue
 
-        for task, class_path in classes.items():
-            model_id = f"{class_path}/{config}"
+        for model in image_models:
             entries.append(
-                {"id": model_id, **common, "endpoint": IMAGE_ENDPOINTS[task], "active": active == model_id}
+                {
+                    "id": model.id,
+                    **common,
+                    "endpoint": IMAGE_ENDPOINTS[model.task],
+                    "active": active == model.id,
+                }
             )
 
     return entries
@@ -552,7 +303,7 @@ def list_cached_models_sync() -> list[dict[str, Any]]:
 
 def decode_data_uri(uri: str) -> bytes:
     """Decode a data URI (RFC 2397), e.g. 'data:image/png;base64,iVBOR...'."""
-    header, sep, payload = uri[len("data:"):].partition(",")
+    header, sep, payload = uri[len("data:") :].partition(",")
     if not sep:
         raise HTTPException(status_code=400, detail="Malformed data URI: missing ','")
 
@@ -561,7 +312,9 @@ def decode_data_uri(uri: str) -> bytes:
             # Clients sometimes wrap long base64 payloads; strip whitespace before strict decoding.
             return base64.b64decode("".join(payload.split()), validate=True)
         except (binascii.Error, ValueError):
-            raise HTTPException(status_code=400, detail="Malformed data URI: invalid base64 payload")
+            raise HTTPException(
+                status_code=400, detail="Malformed data URI: invalid base64 payload"
+            )
 
     return urllib.parse.unquote_to_bytes(payload)
 
@@ -581,11 +334,15 @@ def fetch_image(url: str) -> Image.Image:
         image = Image.open(io.BytesIO(data))
         image.load()
     except Exception:
-        raise HTTPException(status_code=400, detail=f"Input image from {source} is not a readable image")
+        raise HTTPException(
+            status_code=400, detail=f"Input image from {source} is not a readable image"
+        )
     return image
 
 
-def to_chat_messages(request: ResponsesRequest) -> tuple[list[dict[str, str]], list[str]]:
+def to_chat_messages(
+    request: ResponsesRequest,
+) -> tuple[list[dict[str, str]], list[str]]:
     """Flatten Responses input into text-only chat messages plus a list of image URLs."""
     items = (
         [InputMessage(role="user", content=request.input)]
@@ -615,7 +372,9 @@ def to_chat_messages(request: ResponsesRequest) -> tuple[list[dict[str, str]], l
     return messages, images
 
 
-def chat_to_messages(request: ChatCompletionsRequest) -> tuple[list[dict[str, str]], list[str]]:
+def chat_to_messages(
+    request: ChatCompletionsRequest,
+) -> tuple[list[dict[str, str]], list[str]]:
     """Flatten Chat Completions messages into text-only chat messages plus a list of image URLs."""
     messages = []
     images = []
@@ -633,7 +392,11 @@ def chat_to_messages(request: ChatCompletionsRequest) -> tuple[list[dict[str, st
             if part.type == "text":
                 texts.append(part.text or "")
             elif part.type == "image_url" and part.image_url is not None:
-                url = part.image_url if isinstance(part.image_url, str) else part.image_url.url
+                url = (
+                    part.image_url
+                    if isinstance(part.image_url, str)
+                    else part.image_url.url
+                )
                 images.append(url)
         messages.append({"role": role, "content": "\n".join(texts)})
 
@@ -641,7 +404,9 @@ def chat_to_messages(request: ChatCompletionsRequest) -> tuple[list[dict[str, st
 
 
 async def fetch_images(urls: list[str]) -> list[Image.Image]:
-    return list(await asyncio.gather(*(asyncio.to_thread(fetch_image, url) for url in urls)))
+    return list(
+        await asyncio.gather(*(asyncio.to_thread(fetch_image, url) for url in urls))
+    )
 
 
 @dataclass
@@ -659,7 +424,7 @@ class GenerationStats:
 
 async def stream_mlx_generate(
     *,
-    executor: ThreadPoolExecutor,
+    active_model: ActiveModel,
     model_name: str,
     max_tokens: int,
     temperature: float | None,
@@ -670,9 +435,11 @@ async def stream_mlx_generate(
 ) -> AsyncIterator[str]:
     async with active_model.session():
         model, processor, config = await active_model.load(
-            executor, model_name, lambda: (*load(model_name), load_config(model_name))
+            model_name, lambda: (*load(model_name), load_config(model_name))
         )
-        prompt = apply_chat_template(processor, config, messages, num_images=len(images))
+        prompt = apply_chat_template(
+            processor, config, messages, num_images=len(images)
+        )
 
         chunks = stream_generate(
             model,
@@ -684,12 +451,16 @@ async def stream_mlx_generate(
             top_p=top_p,
         )
         # Each step runs on the single MLX thread; the lock is held until the stream ends.
-        while (chunk := await run_on_mlx_thread(executor, next, chunks, None)) is not None:
+        while (chunk := await active_model.run(next, chunks, None)) is not None:
             # Not one chunk per token: mlx_vlm yields an extra result after the loop to flush the
             # detokenizer, so trust its own running count instead of counting chunks.
             stats.tokens = getattr(chunk, "generation_tokens", None) or stats.tokens
-            stats.prompt_tokens = getattr(chunk, "prompt_tokens", 0) or stats.prompt_tokens
-            stats.finish_reason = getattr(chunk, "finish_reason", None) or stats.finish_reason
+            stats.prompt_tokens = (
+                getattr(chunk, "prompt_tokens", 0) or stats.prompt_tokens
+            )
+            stats.finish_reason = (
+                getattr(chunk, "finish_reason", None) or stats.finish_reason
+            )
             if chunk.text:
                 yield chunk.text
 
@@ -785,7 +556,11 @@ def chat_finish_reason(request: ChatCompletionsRequest, stats: GenerationStats) 
 
 
 def chat_completion_object(
-    *, request: ChatCompletionsRequest, completion_id: str, text: str, stats: GenerationStats
+    *,
+    request: ChatCompletionsRequest,
+    completion_id: str,
+    text: str,
+    stats: GenerationStats,
 ) -> dict[str, Any]:
     return {
         "id": completion_id,
@@ -824,8 +599,15 @@ async def stream_chat_chunks(
         }
         return f"data: {json.dumps(payload)}\n\n"
 
-    def choice(delta: dict[str, Any], finish_reason: str | None = None) -> dict[str, Any]:
-        return {"index": 0, "delta": delta, "finish_reason": finish_reason, "logprobs": None}
+    def choice(
+        delta: dict[str, Any], finish_reason: str | None = None
+    ) -> dict[str, Any]:
+        return {
+            "index": 0,
+            "delta": delta,
+            "finish_reason": finish_reason,
+            "logprobs": None,
+        }
 
     yield chunk([choice({"role": "assistant", "content": ""})])
 
@@ -841,7 +623,7 @@ async def stream_chat_chunks(
 
 
 @app.get("/health")
-async def health():
+async def health(active_model: ActiveModelDep):
     return {
         "status": "ok",
         "model": {
@@ -853,28 +635,33 @@ async def health():
 
 
 @app.get("/v1/models")
-async def list_models():
+async def list_models(active_model: ActiveModelDep):
     # Scanning the cache walks the filesystem, so keep it off the event loop.
-    return {"object": "list", "data": await asyncio.to_thread(list_cached_models_sync)}
+    return {
+        "object": "list",
+        "data": await asyncio.to_thread(list_cached_models_sync, active_model.name),
+    }
 
 
 @app.get("/v1/models/{model:path}")
-async def retrieve_model(model: str):
+async def retrieve_model(model: str, active_model: ActiveModelDep):
     # `:path` because HF repo ids contain a slash, e.g. "mlx-community/Qwen2.5-VL-7B-Instruct-4bit".
-    for entry in await asyncio.to_thread(list_cached_models_sync):
+    for entry in await asyncio.to_thread(list_cached_models_sync, active_model.name):
         if entry["id"] == model:
             return entry
-    raise HTTPException(status_code=404, detail=f"Model '{model}' not found in the Hugging Face cache")
+    raise HTTPException(
+        status_code=404, detail=f"Model '{model}' not found in the Hugging Face cache"
+    )
 
 
 @app.post("/v1/responses")
-async def responses(http_request: Request, request: ResponsesRequest):
+async def responses(request: ResponsesRequest, active_model: ActiveModelDep):
     messages, image_urls = to_chat_messages(request)
     images = await fetch_images(image_urls)
 
     stats = GenerationStats()
     chunks = stream_mlx_generate(
-        executor=http_request.app.state.mlx_executor,
+        active_model=active_model,
         model_name=request.model,
         max_tokens=request.max_output_tokens,
         temperature=request.temperature,
@@ -901,13 +688,15 @@ async def responses(http_request: Request, request: ResponsesRequest):
 
 
 @app.post("/v1/chat/completions")
-async def chat_completions(http_request: Request, request: ChatCompletionsRequest):
+async def chat_completions(
+    request: ChatCompletionsRequest, active_model: ActiveModelDep
+):
     messages, image_urls = chat_to_messages(request)
     images = await fetch_images(image_urls)
 
     stats = GenerationStats()
     chunks = stream_mlx_generate(
-        executor=http_request.app.state.mlx_executor,
+        active_model=active_model,
         model_name=request.model,
         max_tokens=request.token_limit(),
         temperature=request.temperature,
@@ -920,17 +709,23 @@ async def chat_completions(http_request: Request, request: ChatCompletionsReques
 
     if request.stream:
         return StreamingResponse(
-            stream_chat_chunks(chunks=chunks, stats=stats, request=request, completion_id=completion_id),
+            stream_chat_chunks(
+                chunks=chunks, stats=stats, request=request, completion_id=completion_id
+            ),
             media_type="text/event-stream",
         )
 
     text = "".join([chunk async for chunk in chunks])
-    return chat_completion_object(request=request, completion_id=completion_id, text=text, stats=stats)
+    return chat_completion_object(
+        request=request, completion_id=completion_id, text=text, stats=stats
+    )
 
 
 @app.post("/v1/images/generations")
-async def images_generations(http_request: Request, request: ImageGenerationRequest):
-    return await run_mflux(http_request.app.state.mlx_executor, request, "generate")
+async def images_generations(
+    request: ImageGenerationRequest, active_model: ActiveModelDep
+):
+    return await run_mflux(active_model, request, "generate")
 
 
 def decode_upload(index: int, filename: str | None, data: bytes) -> Image.Image:
@@ -947,20 +742,24 @@ def decode_upload(index: int, filename: str | None, data: bytes) -> Image.Image:
 
 
 @app.post("/v1/images/edits")
-async def images_edits(http_request: Request):
+async def images_edits(http_request: Request, active_model: ActiveModelDep):
     # Checked before parsing so no upload can exceed the in-memory spool and spill to disk.
     length = http_request.headers.get("content-length")
     if length is None:
         raise HTTPException(status_code=411, detail="Content-Length is required")
     if int(length) > MAX_UPLOAD_BYTES:
-        raise HTTPException(status_code=413, detail=f"Request exceeds {MAX_UPLOAD_BYTES // 1024**2}MB")
+        raise HTTPException(
+            status_code=413, detail=f"Request exceeds {MAX_UPLOAD_BYTES // 1024**2}MB"
+        )
 
     form = await http_request.form()
 
     # The OpenAI SDK sends a list of images as `image[]` and a single image as `image`.
     uploads = form.getlist("image[]") or form.getlist("image")
     if not uploads or not all(isinstance(u, UploadFile) for u in uploads):
-        raise HTTPException(status_code=400, detail="At least one image file is required")
+        raise HTTPException(
+            status_code=400, detail="At least one image file is required"
+        )
     if "mask" in form:
         raise HTTPException(status_code=400, detail="mask is not supported")
 
@@ -983,7 +782,15 @@ async def images_edits(http_request: Request):
         decode_upload(i, upload.filename, await upload.read())
         for i, upload in enumerate(uploads)
     ]
-    return await run_mflux(http_request.app.state.mlx_executor, request, "edit", images=images, )
+    return await run_mflux(active_model, request, "edit", images=images)
+
+
+INDEX_HTML = Path(__file__).parent / "index.html"
+
+
+@app.get("/", include_in_schema=False)
+async def serve_ui():
+    return FileResponse(INDEX_HTML)
 
 
 if __name__ == "__main__":

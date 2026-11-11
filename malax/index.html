@@ -1,0 +1,332 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <meta name="color-scheme" content="light dark">
+    <title>Local AI</title>
+    <link
+            rel="stylesheet"
+            href="https://cdn.jsdelivr.net/npm/@picocss/pico@2/css/pico.classless.jade.min.css"
+    >
+    <style>
+        /* Element selectors only: just the layout the classless build doesn't provide. */
+        footer { position: sticky; bottom: 0; background: var(--pico-background-color); }
+        main article > p { white-space: pre-wrap; }
+        main p img { display: inline-block; height: 8rem; width: auto; margin-right: .5rem; }
+        main figure img { display: block; max-width: 100%; border-radius: var(--pico-border-radius); }
+        details fieldset {
+            display: grid;
+            grid-template-columns: repeat(auto-fill, minmax(11rem, 1fr));
+            column-gap: var(--pico-spacing);
+        }
+    </style>
+</head>
+<body>
+<header>
+    <nav>
+        <ul><li><strong>Local AI</strong></li></ul>
+        <ul>
+            <li><select id="model" aria-label="Model" required></select></li>
+            <li><button id="new-chat" type="button">New chat</button></li>
+        </ul>
+    </nav>
+</header>
+
+<main id="thread"></main>
+
+<footer>
+    <form id="composer">
+        <textarea name="prompt" rows="2" placeholder="Message…" required></textarea>
+        <fieldset role="group">
+            <input type="file" name="images" accept="image/*" multiple aria-label="Attach images">
+            <button type="submit">Send</button>
+        </fieldset>
+        <details>
+            <summary>Settings</summary>
+            <fieldset id="chat-settings">
+                <legend>Chat</legend>
+                <label>System prompt <input name="system" placeholder="none"></label>
+                <label>Temperature <input type="number" name="temperature" min="0" max="2" step="0.1" placeholder="default"></label>
+                <label>Max tokens <input type="number" name="max_tokens" min="1" step="1" placeholder="512"></label>
+            </fieldset>
+            <fieldset id="image-settings">
+                <legend>Image</legend>
+                <label>Size
+                    <select name="size">
+                        <option value="">Default</option>
+                        <option>auto</option>
+                        <option>512x512</option>
+                        <option>768x768</option>
+                        <option>1024x1024</option>
+                        <option>1024x768</option>
+                        <option>768x1024</option>
+                    </select>
+                </label>
+                <label>Steps <input type="number" name="steps" min="1" step="1" placeholder="default"></label>
+                <label>Seed <input type="number" name="seed" min="0" step="1" placeholder="random"></label>
+                <label id="strength-field">Image strength
+                    <input type="number" name="image_strength" min="0.05" max="0.95" step="0.05" placeholder="img2img models only">
+                </label>
+                <label>LoRA <input name="lora_path" placeholder="repo or repo:file.safetensors"></label>
+                <label>LoRA scale <input type="number" name="lora_scale" step="0.1" placeholder="1.0"></label>
+            </fieldset>
+        </details>
+    </form>
+</footer>
+
+<script type="module">
+    const $ = (id) => document.getElementById(id);
+    const modelSelect = $("model");
+    const thread = $("thread");
+    const form = $("composer");
+    const submitButton = form.querySelector("[type=submit]");
+
+    // /v1/models tags image models with the endpoint that serves them; anything else is a chat model.
+    const MODES = { "/v1/images/generations": "generate", "/v1/images/edits": "edit" };
+    const GROUPS = { chat: "Chat", generate: "Image generation", edit: "Image editing" };
+    const PLACEHOLDERS = { chat: "Message…", generate: "Describe an image…", edit: "Describe the edit…" };
+
+    // The gateway is stateless, so the whole conversation goes back on every chat turn.
+    let history = [];
+
+    // ---------- helpers ----------
+
+    function el(tag, props = {}, ...children) {
+        const node = Object.assign(document.createElement(tag), props);
+        node.append(...children);
+        return node;
+    }
+
+    function addTurn(who, ...children) {
+        const article = el("article", {}, el("header", {}, el("strong", { textContent: who })), ...children);
+        thread.append(article);
+        article.scrollIntoView({ block: "end", behavior: "smooth" });
+        return article;
+    }
+
+    async function api(path, init) {
+        const res = await fetch(path, init);
+        if (!res.ok) throw new Error(await errorMessage(res));
+        return res;
+    }
+
+    async function errorMessage(res) {
+        const body = await res.text();
+        try {
+            const { detail } = JSON.parse(body);
+            return typeof detail === "string" ? detail : JSON.stringify(detail, null, 2);
+        } catch {
+            return `${res.status} ${res.statusText}: ${body}`;
+        }
+    }
+
+    const postJSON = (body) => ({
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(body),
+    });
+
+    const num = (settings, name) => {
+        const value = settings.get(name);
+        return value === null || value === "" ? undefined : Number(value);
+    };
+
+    const toDataURL = (file) => new Promise((resolve, reject) => {
+        const reader = new FileReader();
+        reader.onload = () => resolve(reader.result);
+        reader.onerror = () => reject(reader.error);
+        reader.readAsDataURL(file);
+    });
+
+    const mode = () => modelSelect.selectedOptions[0]?.dataset.mode ?? "chat";
+
+    // ---------- models ----------
+
+    async function loadModels() {
+        const { data } = await (await api("/v1/models")).json();
+        const groups = Object.fromEntries(
+            Object.entries(GROUPS).map(([key, label]) => [key, el("optgroup", { label })])
+        );
+        for (const model of data) {
+            const option = new Option(model.active ? `${model.id} (loaded)` : model.id, model.id);
+            option.dataset.mode = MODES[model.endpoint] ?? "chat";
+            groups[option.dataset.mode].append(option);
+        }
+        modelSelect.replaceChildren(...Object.values(groups).filter((g) => g.children.length));
+        modelSelect.value = localStorage.getItem("model") ?? "";
+        if (!modelSelect.value) modelSelect.selectedIndex = 0;
+        updateMode();
+    }
+
+    function updateMode() {
+        const current = mode();
+        localStorage.setItem("model", modelSelect.value);
+        $("chat-settings").hidden = current !== "chat";
+        $("image-settings").hidden = current === "chat";
+        $("strength-field").hidden = current !== "edit";
+        form.images.hidden = current === "generate";
+        form.images.required = current === "edit";
+        form.prompt.placeholder = PLACEHOLDERS[current];
+    }
+
+    // ---------- chat ----------
+
+    async function* streamChat(body) {
+        const res = await api("/v1/chat/completions", postJSON({ ...body, stream: true }));
+        const reader = res.body.pipeThrough(new TextDecoderStream()).getReader();
+        let buffer = "";
+        while (true) {
+            const { value, done } = await reader.read();
+            if (done) return;
+            buffer += value;
+            const events = buffer.split("\n\n");
+            buffer = events.pop();
+            for (const event of events) {
+                const data = event.replace(/^data: /, "");
+                if (data === "[DONE]") return;
+                const choice = JSON.parse(data).choices[0];
+                if (choice) yield choice;
+            }
+        }
+    }
+
+    async function chat({ model, prompt, files, reply, settings }) {
+        const imageParts = (await Promise.all(files.map(toDataURL)))
+            .map((url) => ({ type: "image_url", image_url: { url } }));
+        const content = imageParts.length ? [{ type: "text", text: prompt }, ...imageParts] : prompt;
+        history.push({ role: "user", content });
+
+        const system = settings.get("system").trim();
+        const body = {
+            model,
+            messages: system ? [{ role: "system", content: system }, ...history] : history,
+            temperature: num(settings, "temperature"),
+            max_completion_tokens: num(settings, "max_tokens"),
+        };
+
+        const output = reply.appendChild(el("p"));
+        let text = "";
+        let finishReason = null;
+        try {
+            for await (const choice of streamChat(body)) {
+                if (choice.delta?.content) {
+                    text += choice.delta.content;
+                    output.textContent = text;
+                }
+                finishReason = choice.finish_reason ?? finishReason;
+            }
+        } catch (error) {
+            history.pop(); // Don't keep a user turn the model never answered.
+            throw error;
+        }
+        history.push({ role: "assistant", content: text });
+        if (finishReason === "length") reply.append(el("small", { textContent: "Stopped at the token limit." }));
+    }
+
+    // ---------- images ----------
+
+    function imageOptions(settings, isEdit) {
+        const options = {
+            size: settings.get("size") || undefined,
+            steps: num(settings, "steps"),
+            seed: num(settings, "seed"),
+            image_strength: isEdit ? num(settings, "image_strength") : undefined,
+        };
+        const lora = settings.get("lora_path").trim();
+        if (lora) {
+            options.lora_paths = [lora];
+            options.lora_scales = [num(settings, "lora_scale") ?? 1];
+        }
+        return Object.fromEntries(Object.entries(options).filter(([, v]) => v !== undefined));
+    }
+
+    function showImages(reply, { data }, prompt) {
+        for (const { b64_json } of data) {
+            const src = `data:image/png;base64,${b64_json}`;
+            reply.append(el("figure", {},
+                el("img", { src, alt: prompt }),
+                el("figcaption", {}, el("a", { href: src, download: "image.png", textContent: "Download" })),
+            ));
+        }
+    }
+
+    async function generate({ model, prompt, reply, settings }) {
+        const res = await api("/v1/images/generations", postJSON({ model, prompt, ...imageOptions(settings, false) }));
+        showImages(reply, await res.json(), prompt);
+    }
+
+    async function edit({ model, prompt, files, reply, settings }) {
+        const body = new FormData();
+        body.append("model", model);
+        body.append("prompt", prompt);
+        for (const file of files) body.append("image[]", file);
+        // Multipart has no arrays; the gateway reads repeated `key[]` fields as lists.
+        for (const [key, value] of Object.entries(imageOptions(settings, true))) {
+            if (Array.isArray(value)) value.forEach((v) => body.append(`${key}[]`, v));
+            else body.append(key, value);
+        }
+        const res = await api("/v1/images/edits", { method: "POST", body });
+        showImages(reply, await res.json(), prompt);
+    }
+
+    const HANDLERS = { chat, generate, edit };
+
+    // ---------- wiring ----------
+
+    form.addEventListener("submit", async (event) => {
+        event.preventDefault();
+        const model = modelSelect.value;
+        const settings = new FormData(form);
+        const prompt = settings.get("prompt").trim();
+        if (!model || !prompt) return;
+
+        const current = mode();
+        const files = current === "generate" ? [] : [...form.images.files];
+
+        addTurn("You",
+            el("p", { textContent: prompt }),
+            ...(files.length
+                ? [el("p", {}, ...files.map((f) => el("img", { src: URL.createObjectURL(f), alt: f.name })))]
+                : []),
+        );
+        const reply = addTurn(model);
+        const status = reply.querySelector("header");
+        status.setAttribute("aria-busy", "true");
+        submitButton.disabled = true;
+        form.prompt.value = "";
+        form.images.value = "";
+
+        try {
+            await HANDLERS[current]({ model, prompt, files, reply, settings });
+        } catch (error) {
+            reply.append(el("p", {}, el("mark", { textContent: error.message })));
+        } finally {
+            status.removeAttribute("aria-busy");
+            submitButton.disabled = false;
+            form.prompt.focus();
+            reply.scrollIntoView({ block: "end", behavior: "smooth" });
+            loadModels().catch(() => {}); // Refresh the "(loaded)" marker.
+        }
+    });
+
+    // Enter sends, Shift+Enter adds a newline (and IME composition is left alone).
+    form.prompt.addEventListener("keydown", (event) => {
+        if (event.key === "Enter" && !event.shiftKey && !event.isComposing) {
+            event.preventDefault();
+            form.requestSubmit();
+        }
+    });
+
+    modelSelect.addEventListener("change", updateMode);
+
+    $("new-chat").addEventListener("click", () => {
+        history = [];
+        thread.replaceChildren();
+        form.prompt.focus();
+    });
+
+    loadModels().catch((error) => addTurn("Error", el("p", { textContent: error.message })));
+</script>
+</body>
+</html>
