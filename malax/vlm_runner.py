@@ -3,6 +3,8 @@
 from collections.abc import AsyncIterator
 from dataclasses import dataclass
 
+from fastapi import HTTPException
+from huggingface_hub.errors import RepositoryNotFoundError
 from mlx_vlm import load, stream_generate
 from mlx_vlm.prompt_utils import apply_chat_template
 from mlx_vlm.utils import load_config
@@ -37,9 +39,16 @@ async def stream_mlx_generate(
 ) -> AsyncIterator[str]:
     """Stream text deltas; `stats` is filled in as generation goes, and is final once the stream ends."""
     async with active_model.session():
-        model, processor, config = await active_model.load(
-            model_name, lambda: (*load(model_name), load_config(model_name))
-        )
+        try:
+            model, processor, config = await active_model.load(
+                model_name, lambda: (*load(model_name), load_config(model_name))
+            )
+        except RepositoryNotFoundError:
+            # Hugging Face also reports gated or private repos this way (it answers 401 for missing repos too).
+            raise HTTPException(
+                status_code=404,
+                detail=f"Model '{model_name}' not found on Hugging Face or in the local cache",
+            )
         prompt = apply_chat_template(
             processor, config, messages, num_images=len(images)
         )

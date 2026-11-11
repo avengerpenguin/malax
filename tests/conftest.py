@@ -1,3 +1,6 @@
+import base64
+from pathlib import Path
+
 import pytest
 from openai import OpenAI
 from fastapi.testclient import TestClient
@@ -5,27 +8,34 @@ from fastapi.testclient import TestClient
 from dataclasses import dataclass
 
 MODEL = "mlx-community/Qwen3.5-4B-MLX-4bit"
+HERE = Path(__file__).parent
 
 
-@pytest.fixture
+def data_uri(name: str, mime: str) -> str:
+    return f"data:{mime};base64,{base64.b64encode((HERE / name).read_bytes()).decode()}"
+
+
+@pytest.fixture(scope="session")
 def server():
     from malax.server import app
+
     return app
 
 
-@pytest.fixture
+@pytest.fixture(scope="session")
 def http_client(server):
     with TestClient(server) as c:
         yield c
 
 
-@pytest.fixture
+@pytest.fixture(scope="session")
 def client(http_client):
     return OpenAI(
         api_key="dummy",
         base_url="http://testserver/v1",
         http_client=http_client,
     )
+
 
 @dataclass
 class Result:
@@ -45,7 +55,9 @@ class ResponsesAPI:
             {"type": "input_image", "image_url": image_url},
         ]
 
-    def create(self, *, user, system=None, image_url=None, max_tokens=None, **sampling) -> Result:
+    def create(
+        self, *, user, system=None, image_url=None, max_tokens=None, **sampling
+    ) -> Result:
         kwargs = {"max_output_tokens": max_tokens} if max_tokens else {}
         r = self.client.responses.create(
             model=MODEL,
@@ -60,7 +72,9 @@ class ResponsesAPI:
         events = self.client.responses.create(
             model=MODEL, input=[{"role": "user", "content": user}], stream=True
         )
-        return "".join(e.delta for e in events if e.type == "response.output_text.delta")
+        return "".join(
+            e.delta for e in events if e.type == "response.output_text.delta"
+        )
 
 
 class ChatCompletionsAPI:
@@ -68,20 +82,31 @@ class ChatCompletionsAPI:
         self.client = client
 
     def _messages(self, user, system, image_url):
-        content = user if image_url is None else [
-            {"type": "text", "text": user},
-            {"type": "image_url", "image_url": {"url": image_url}},
-        ]
+        content = (
+            user
+            if image_url is None
+            else [
+                {"type": "text", "text": user},
+                {"type": "image_url", "image_url": {"url": image_url}},
+            ]
+        )
         system_msg = [{"role": "system", "content": system}] if system else []
         return [*system_msg, {"role": "user", "content": content}]
 
-    def create(self, *, user, system=None, image_url=None, max_tokens=None, **sampling) -> Result:
+    def create(
+        self, *, user, system=None, image_url=None, max_tokens=None, **sampling
+    ) -> Result:
         kwargs = {"max_tokens": max_tokens} if max_tokens else {}
         c = self.client.chat.completions.create(
-            model=MODEL, messages=self._messages(user, system, image_url), **kwargs, **sampling
+            model=MODEL,
+            messages=self._messages(user, system, image_url),
+            **kwargs,
+            **sampling,
         )
         choice = c.choices[0]
-        return Result(text=choice.message.content, truncated=choice.finish_reason == "length")
+        return Result(
+            text=choice.message.content, truncated=choice.finish_reason == "length"
+        )
 
     def stream(self, *, user) -> str:
         chunks = self.client.chat.completions.create(
@@ -97,4 +122,3 @@ class ChatCompletionsAPI:
 @pytest.fixture(params=[ResponsesAPI, ChatCompletionsAPI], ids=["responses", "chat"])
 def api(request, client):
     return request.param(client)
-

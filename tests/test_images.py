@@ -2,6 +2,11 @@ import base64
 from pathlib import Path
 import openai
 import pytest
+from PIL import Image
+
+from malax.mflux_runner import ImageEditRequest
+
+pytestmark = pytest.mark.slow
 
 SEED = 1729
 SIZE = "512x512"
@@ -15,10 +20,12 @@ listen to the heartbeat of a baby otter.
 """
 
 
-def save(result, name: str) -> Path:
+def save(result, name: str, size: tuple[int, int] = (512, 512)) -> Path:
     OUTPUT.mkdir(exist_ok=True)
     path = OUTPUT / name
     path.write_bytes(base64.b64decode(result.data[0].b64_json))
+    with Image.open(path) as image:
+        assert image.format == "PNG" and image.size == size
     return path
 
 
@@ -54,7 +61,10 @@ def test_image_edit(client):
     the fresh red apple on a dark, rustic wooden table.
     """
 
-    with open(HERE / "apple.jpg", "rb") as apple, open(HERE / "vases.jpg", "rb") as vases:
+    with (
+        open(HERE / "apple.jpg", "rb") as apple,
+        open(HERE / "vases.jpg", "rb") as vases,
+    ):
         result = client.images.edit(
             model="flux2.variants.Flux2KleinEdit/flux2_klein_4b",
             image=[apple, vases],
@@ -63,6 +73,7 @@ def test_image_edit(client):
             extra_body={"seed": SEED, "steps": 4},
         )
     save(result, "painting.png")
+
 
 def test_image_edit_zimage(client):
     with open(HERE / "car.png", "rb") as car:
@@ -84,6 +95,7 @@ def test_image_edit_rejects_non_image(client):
             prompt="anything",
         )
 
+
 def test_image_edit_lora(client):
     with open(HERE / "car.png", "rb") as car:
         result = client.images.edit(
@@ -94,8 +106,39 @@ def test_image_edit_lora(client):
             extra_body={
                 "seed": SEED,
                 "steps": 4,
-                "lora_paths": ["fal/flux-2-klein-4b-spritesheet-lora:flux-spritesheet-lora.safetensors"],
+                "lora_paths": [
+                    "fal/flux-2-klein-4b-spritesheet-lora:flux-spritesheet-lora.safetensors"
+                ],
                 "lora_scales": [1.1],
             },
         )
     save(result, "car_sprite.png")
+
+
+def test_image_edit_auto_size_follows_input(client):
+    with open(HERE / "car.png", "rb") as car:
+        with Image.open(car) as reference:
+            expected = ImageEditRequest(model="-", prompt="-").size_kwargs(reference)
+        car.seek(0)
+        result = client.images.edit(
+            model="flux2.variants.Flux2KleinEdit/flux2_klein_4b",
+            image=[car],
+            prompt="The same car, at night",
+            extra_body={
+                "seed": SEED,
+                "steps": 4,
+            },  # no size: the edit default is "auto"
+        )
+    save(result, "car_night.png", (expected["width"], expected["height"]))
+
+
+def test_bare_model_name_and_multiple_images(client):
+    result = client.images.generate(
+        model="flux2_klein_4b",  # expanded server-side to flux2.variants.Flux2Klein/flux2_klein_4b
+        prompt=OTTER_PROMPT,
+        size=SIZE,
+        n=2,
+        extra_body={"seed": SEED, "steps": 4},
+    )
+    assert len(result.data) == 2
+    assert result.data[0].b64_json != result.data[1].b64_json  # seed + i per image

@@ -621,7 +621,10 @@ async def images_edits(http_request: Request, active_model: ActiveModelDep):
     try:
         request = ImageEditRequest(**fields)
     except ValidationError as e:
-        raise HTTPException(status_code=422, detail=e.errors())
+        # e.errors() can hold the raw exception from a model_validator in `ctx`; e.json() stringifies it.
+        raise HTTPException(
+            status_code=422, detail=json.loads(e.json(include_url=False))
+        )
 
     images = [
         decode_upload(i, upload.filename, await upload.read())
