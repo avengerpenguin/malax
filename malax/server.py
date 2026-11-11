@@ -45,12 +45,11 @@ MAX_UPLOAD_BYTES = int(float(os.getenv("MAX_UPLOAD_MB", "50")) * 1024**2)
 # Starlette spools uploads over 1MB to a temp file. Images must never touch the disk, so raise the
 # threshold to the request cap; images_edits rejects anything bigger before parsing the form.
 MultiPartParser.spool_max_size = MAX_UPLOAD_BYTES
-mlx_executor: ThreadPoolExecutor | None = None
 
 
-async def run_on_mlx_thread(func, *args, **kwargs):
+async def run_on_mlx_thread(executor: ThreadPoolExecutor, func, *args, **kwargs):
     loop = asyncio.get_running_loop()
-    return await loop.run_in_executor(mlx_executor, lambda: func(*args, **kwargs))
+    return await loop.run_in_executor(executor, lambda: func(*args, **kwargs))
 
 
 def clear_mlx_cache_sync():
@@ -98,20 +97,20 @@ class ActiveModel:
         finally:
             self.lock.release()
 
-    async def load(self, name: str, loader: Callable[[], Any]) -> Any:
+    async def load(self, executor: ThreadPoolExecutor, name: str, loader: Callable[[], Any]) -> Any:
         if self.name == name:
             return self.model
 
-        await self.unload()
+        await self.unload(executor)
 
         print(f"Loading model: {name}")
-        self.model = await run_on_mlx_thread(load_sync, loader)
+        self.model = await run_on_mlx_thread(executor, load_sync, loader)
         self.name = name
         print(f"Loaded model: {name} ({memory_stats()})")
 
         return self.model
 
-    async def unload(self):
+    async def unload(self, executor: ThreadPoolExecutor):
         if self.model is None:
             return
 
@@ -128,7 +127,7 @@ class ActiveModel:
         self.model = None
         self.name = None
 
-        await run_on_mlx_thread(clear_mlx_cache_sync)
+        await run_on_mlx_thread(executor, clear_mlx_cache_sync)
 
         if ref is not None and (leaked := ref()) is not None:
             holders = [type(r).__name__ for r in gc.get_referrers(leaked)]
@@ -159,6 +158,46 @@ class ResponsesRequest(BaseModel):
     temperature: float | None = None
     top_p: float | None = None
     stream: bool = False
+
+
+DEFAULT_MAX_TOKENS = 512
+
+
+class ChatImageURL(BaseModel):
+    url: str
+    detail: str | None = None
+
+
+class ChatContentPart(BaseModel):
+    type: str
+    text: str | None = None
+    # The spec uses {"url": ...}; some legacy clients send a bare string.
+    image_url: ChatImageURL | str | None = None
+
+
+class ChatMessage(BaseModel):
+    role: str
+    # None is valid for assistant messages that only carried tool calls.
+    content: str | list[ChatContentPart] | None = None
+
+
+class ChatStreamOptions(BaseModel):
+    include_usage: bool = False
+
+
+class ChatCompletionsRequest(BaseModel):
+    model: str
+    messages: list[ChatMessage]
+    # Legacy clients send max_tokens; newer SDKs send max_completion_tokens.
+    max_tokens: int | None = None
+    max_completion_tokens: int | None = None
+    temperature: float | None = None
+    top_p: float | None = None
+    stream: bool = False
+    stream_options: ChatStreamOptions | None = None
+
+    def token_limit(self) -> int:
+        return self.max_completion_tokens or self.max_tokens or DEFAULT_MAX_TOKENS
 
 
 SIZE_PATTERN = r"^(auto|\d+x\d+)$"
@@ -271,16 +310,15 @@ def expand_image_model(name: str, task: ImageTask) -> str:
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    global mlx_executor
-
-    mlx_executor = ThreadPoolExecutor(max_workers=1)
+    executor = ThreadPoolExecutor(max_workers=1)
+    app.state.mlx_executor = executor
     mx.set_cache_limit(int(MLX_CACHE_LIMIT_GB * 1024**3))
     print("Local ML gateway starting")
 
     yield
 
-    await active_model.unload()
-    mlx_executor.shutdown(wait=True, cancel_futures=False)
+    await active_model.unload(executor)
+    executor.shutdown(wait=True, cancel_futures=False)
 
 
 app = FastAPI(
@@ -432,7 +470,10 @@ def generate_images_sync(
 
 
 async def run_mflux(
-    request: ImageGenerationRequest, task: ImageTask, images: list[Image.Image] | None = None
+    executor: ThreadPoolExecutor,
+    request: ImageGenerationRequest,
+    task: ImageTask,
+    images: list[Image.Image] | None = None,
 ) -> dict[str, Any]:
     """Load the requested mflux model and generate images; shared by generations and edits."""
     images = images or []
@@ -446,8 +487,8 @@ async def run_mflux(
 
     try:
         async with active_model.session():
-            model = await active_model.load(request.model_key(), loader)
-            images_b64 = await run_on_mlx_thread(generate_images_sync, model, request, size, **inputs)
+            model = await active_model.load(executor, request.model_key(), loader)
+            images_b64 = await run_on_mlx_thread(executor, generate_images_sync, model, request, size, **inputs)
     except Exception as e:
         traceback.print_exc()
         raise HTTPException(status_code=500, detail=str(e))
@@ -574,21 +615,62 @@ def to_chat_messages(request: ResponsesRequest) -> tuple[list[dict[str, str]], l
     return messages, images
 
 
+def chat_to_messages(request: ChatCompletionsRequest) -> tuple[list[dict[str, str]], list[str]]:
+    """Flatten Chat Completions messages into text-only chat messages plus a list of image URLs."""
+    messages = []
+    images = []
+
+    for message in request.messages:
+        # "developer" is the newer name for "system"; chat templates only know "system".
+        role = "system" if message.role == "developer" else message.role
+
+        if message.content is None or isinstance(message.content, str):
+            messages.append({"role": role, "content": message.content or ""})
+            continue
+
+        texts = []
+        for part in message.content:
+            if part.type == "text":
+                texts.append(part.text or "")
+            elif part.type == "image_url" and part.image_url is not None:
+                url = part.image_url if isinstance(part.image_url, str) else part.image_url.url
+                images.append(url)
+        messages.append({"role": role, "content": "\n".join(texts)})
+
+    return messages, images
+
+
+async def fetch_images(urls: list[str]) -> list[Image.Image]:
+    return list(await asyncio.gather(*(asyncio.to_thread(fetch_image, url) for url in urls)))
+
+
 @dataclass
 class GenerationStats:
     tokens: int = 0
+    prompt_tokens: int = 0
+    finish_reason: str | None = None
+
+    def truncated(self, limit: int) -> bool:
+        # Prefer the library's own verdict; fall back to comparing against the limit.
+        if self.finish_reason is not None:
+            return self.finish_reason == "length"
+        return self.tokens >= limit
 
 
 async def stream_mlx_generate(
     *,
-    request: ResponsesRequest,
+    executor: ThreadPoolExecutor,
+    model_name: str,
+    max_tokens: int,
+    temperature: float | None,
+    top_p: float | None,
     messages: list[dict[str, str]],
     images: list[Image.Image],
     stats: GenerationStats,
 ) -> AsyncIterator[str]:
     async with active_model.session():
         model, processor, config = await active_model.load(
-            request.model, lambda: (*load(request.model), load_config(request.model))
+            executor, model_name, lambda: (*load(model_name), load_config(model_name))
         )
         prompt = apply_chat_template(processor, config, messages, num_images=len(images))
 
@@ -597,13 +679,17 @@ async def stream_mlx_generate(
             processor,
             prompt,
             images or None,
-            max_tokens=request.max_output_tokens,
-            temperature=request.temperature,
-            top_p=request.top_p,
+            max_tokens=max_tokens,
+            temperature=temperature,
+            top_p=top_p,
         )
         # Each step runs on the single MLX thread; the lock is held until the stream ends.
-        while (chunk := await run_on_mlx_thread(next, chunks, None)) is not None:
-            stats.tokens += 1
+        while (chunk := await run_on_mlx_thread(executor, next, chunks, None)) is not None:
+            # Not one chunk per token: mlx_vlm yields an extra result after the loop to flush the
+            # detokenizer, so trust its own running count instead of counting chunks.
+            stats.tokens = getattr(chunk, "generation_tokens", None) or stats.tokens
+            stats.prompt_tokens = getattr(chunk, "prompt_tokens", 0) or stats.prompt_tokens
+            stats.finish_reason = getattr(chunk, "finish_reason", None) or stats.finish_reason
             if chunk.text:
                 yield chunk.text
 
@@ -679,11 +765,79 @@ async def stream_response_events(
             logprobs=[],
         )
 
-    truncated = stats.tokens >= request.max_output_tokens
+    truncated = stats.truncated(request.max_output_tokens)
     yield event(
         "response.incomplete" if truncated else "response.completed",
         response=response_object(**ids, text=text, truncated=truncated),
     )
+
+
+def chat_usage(stats: GenerationStats) -> dict[str, int]:
+    return {
+        "prompt_tokens": stats.prompt_tokens,
+        "completion_tokens": stats.tokens,
+        "total_tokens": stats.prompt_tokens + stats.tokens,
+    }
+
+
+def chat_finish_reason(request: ChatCompletionsRequest, stats: GenerationStats) -> str:
+    return "length" if stats.truncated(request.token_limit()) else "stop"
+
+
+def chat_completion_object(
+    *, request: ChatCompletionsRequest, completion_id: str, text: str, stats: GenerationStats
+) -> dict[str, Any]:
+    return {
+        "id": completion_id,
+        "object": "chat.completion",
+        "created": now_unix(),
+        "model": request.model,
+        "choices": [
+            {
+                "index": 0,
+                "message": {"role": "assistant", "content": text},
+                "finish_reason": chat_finish_reason(request, stats),
+                "logprobs": None,
+            }
+        ],
+        "usage": chat_usage(stats),
+    }
+
+
+async def stream_chat_chunks(
+    *,
+    chunks: AsyncIterator[str],
+    stats: GenerationStats,
+    request: ChatCompletionsRequest,
+    completion_id: str,
+) -> AsyncIterator[str]:
+    created = now_unix()
+
+    def chunk(choices: list[dict[str, Any]], **extra: Any) -> str:
+        payload = {
+            "id": completion_id,
+            "object": "chat.completion.chunk",
+            "created": created,
+            "model": request.model,
+            "choices": choices,
+            **extra,
+        }
+        return f"data: {json.dumps(payload)}\n\n"
+
+    def choice(delta: dict[str, Any], finish_reason: str | None = None) -> dict[str, Any]:
+        return {"index": 0, "delta": delta, "finish_reason": finish_reason, "logprobs": None}
+
+    yield chunk([choice({"role": "assistant", "content": ""})])
+
+    async for delta in chunks:
+        yield chunk([choice({"content": delta})])
+
+    yield chunk([choice({}, chat_finish_reason(request, stats))])
+
+    if request.stream_options and request.stream_options.include_usage:
+        yield chunk([], usage=chat_usage(stats))
+
+    yield "data: [DONE]\n\n"
 
 
 @app.get("/health")
@@ -714,15 +868,20 @@ async def retrieve_model(model: str):
 
 
 @app.post("/v1/responses")
-async def responses(request: ResponsesRequest):
+async def responses(http_request: Request, request: ResponsesRequest):
     messages, image_urls = to_chat_messages(request)
-    images = await asyncio.gather(
-        *(asyncio.to_thread(fetch_image, url) for url in image_urls)
-    )
+    images = await fetch_images(image_urls)
 
     stats = GenerationStats()
     chunks = stream_mlx_generate(
-        request=request, messages=messages, images=images, stats=stats
+        executor=http_request.app.state.mlx_executor,
+        model_name=request.model,
+        max_tokens=request.max_output_tokens,
+        temperature=request.temperature,
+        top_p=request.top_p,
+        messages=messages,
+        images=images,
+        stats=stats,
     )
     ids = {
         "request": request,
@@ -737,13 +896,41 @@ async def responses(request: ResponsesRequest):
         )
 
     text = "".join([chunk async for chunk in chunks])
-    truncated = stats.tokens >= request.max_output_tokens
+    truncated = stats.truncated(request.max_output_tokens)
     return response_object(**ids, text=text, truncated=truncated)
 
 
+@app.post("/v1/chat/completions")
+async def chat_completions(http_request: Request, request: ChatCompletionsRequest):
+    messages, image_urls = chat_to_messages(request)
+    images = await fetch_images(image_urls)
+
+    stats = GenerationStats()
+    chunks = stream_mlx_generate(
+        executor=http_request.app.state.mlx_executor,
+        model_name=request.model,
+        max_tokens=request.token_limit(),
+        temperature=request.temperature,
+        top_p=request.top_p,
+        messages=messages,
+        images=images,
+        stats=stats,
+    )
+    completion_id = f"chatcmpl-{uuid.uuid4().hex}"
+
+    if request.stream:
+        return StreamingResponse(
+            stream_chat_chunks(chunks=chunks, stats=stats, request=request, completion_id=completion_id),
+            media_type="text/event-stream",
+        )
+
+    text = "".join([chunk async for chunk in chunks])
+    return chat_completion_object(request=request, completion_id=completion_id, text=text, stats=stats)
+
+
 @app.post("/v1/images/generations")
-async def images_generations(request: ImageGenerationRequest):
-    return await run_mflux(request, "generate")
+async def images_generations(http_request: Request, request: ImageGenerationRequest):
+    return await run_mflux(http_request.app.state.mlx_executor, request, "generate")
 
 
 def decode_upload(index: int, filename: str | None, data: bytes) -> Image.Image:
@@ -796,7 +983,7 @@ async def images_edits(http_request: Request):
         decode_upload(i, upload.filename, await upload.read())
         for i, upload in enumerate(uploads)
     ]
-    return await run_mflux(request, "edit", images=images)
+    return await run_mflux(http_request.app.state.mlx_executor, request, "edit", images=images, )
 
 
 if __name__ == "__main__":
